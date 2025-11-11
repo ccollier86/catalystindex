@@ -48,7 +48,9 @@ def test_ingest_and_search_flow():
     )
     assert ingest_response.status_code == 200
     data = ingest_response.json()
-    assert data["chunk_count"] > 0
+    assert data["status"] == "completed"
+    assert data["document"]["chunk_count"] > 0
+    assert data["document"]["chunks"]
 
     search_response = client.post(
         "/search/query",
