@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 from ..models.common import ChunkRecord, RetrievalResult, Tenant
 
@@ -12,6 +13,7 @@ class VectorDocument:
     chunk: ChunkRecord
     vector: Sequence[float]
     track: str
+    sparse_vector: Mapping[int, float] | None = None
 
 
 class VectorStoreClient:
@@ -72,6 +74,159 @@ class InMemoryVectorStore(VectorStoreClient):
         return results[:limit]
 
 
+class QdrantVectorStore(VectorStoreClient):
+    """Vector store implementation backed by Qdrant collections."""
+
+    def __init__(
+        self,
+        client: object,
+        *,
+        collection_prefix: str,
+        vector_size: int,
+        sparse_enabled: bool = False,
+        metadata_fields: MutableMapping[str, object] | None = None,
+    ) -> None:
+        try:
+            from qdrant_client import QdrantClient  # type: ignore  # pragma: no cover
+        except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "QdrantVectorStore requires the 'qdrant-client' package. Install optional dependencies to enable it."
+            ) from exc
+
+        if not isinstance(client, QdrantClient):  # pragma: no cover - type guard
+            raise TypeError("client must be an instance of qdrant_client.QdrantClient")
+        from qdrant_client.http import models as rest
+
+        self._client: QdrantClient = client
+        self._rest = rest
+        self._collection_prefix = collection_prefix.rstrip(":")
+        self._vector_size = vector_size
+        self._sparse_enabled = sparse_enabled
+        self._metadata_fields = metadata_fields or {}
+
+    def upsert(self, tenant: Tenant, documents: Iterable[VectorDocument]) -> None:
+        grouped: Dict[str, List[VectorDocument]] = defaultdict(list)
+        for document in documents:
+            grouped[document.track].append(document)
+        for track, docs in grouped.items():
+            collection = self._collection_name(track)
+            self._ensure_collection(collection)
+            points = [self._build_point(tenant, doc) for doc in docs]
+            self._client.upsert(collection_name=collection, points=points)
+
+    def query(
+        self,
+        tenant: Tenant,
+        vector: Sequence[float],
+        *,
+        track: str,
+        limit: int,
+        filters: Dict[str, object] | None = None,
+    ) -> List[RetrievalResult]:
+        collection = self._collection_name(track)
+        if not self._collection_exists(collection):
+            return []
+        qdrant_filter = self._build_filter(tenant, track, filters)
+        search_params = self._rest.SearchParams(exact=False)
+        results = self._client.search(
+            collection_name=collection,
+            query_vector=vector,
+            query_filter=qdrant_filter,
+            limit=limit,
+            search_params=search_params,
+        )
+        retrievals: List[RetrievalResult] = []
+        for point in results:
+            payload = point.payload or {}
+            chunk_payload = payload.get("chunk")
+            if not chunk_payload:
+                continue
+            chunk = ChunkRecord(**chunk_payload)
+            retrievals.append(
+                RetrievalResult(
+                    chunk=chunk,
+                    score=float(point.score or 0.0),
+                    track=payload.get("track", track),
+                    vision_context=payload.get("vision_context"),
+                )
+            )
+        retrievals.sort(key=lambda item: item.score, reverse=True)
+        return retrievals
+
+    # Internal helpers -------------------------------------------------
+    def _collection_name(self, track: str) -> str:
+        return f"{self._collection_prefix}_{track}"
+
+    def _ensure_collection(self, collection: str) -> None:
+        if self._collection_exists(collection):
+            return
+        vectors_config = self._rest.VectorParams(size=self._vector_size, distance=self._rest.Distance.COSINE)
+        self._client.create_collection(
+            collection_name=collection,
+            vectors_config=vectors_config,
+            sparse_vectors_config=None,
+        )
+
+    def _collection_exists(self, collection: str) -> bool:
+        try:
+            self._client.get_collection(collection)
+            return True
+        except Exception:  # pragma: no cover - passthrough to qdrant
+            return False
+
+    def _build_point(self, tenant: Tenant, document: VectorDocument):
+        from qdrant_client.http import models as rest
+
+        payload = {
+            "tenant_org": tenant.org_id,
+            "tenant_workspace": tenant.workspace_id,
+            "track": document.track,
+            "chunk": _chunk_to_payload(document.chunk),
+            "chunk_tier": document.chunk.chunk_tier,
+            "section_slug": document.chunk.section_slug,
+            "vision_context": document.chunk.metadata.get("vision"),
+        }
+        payload.update(self._metadata_fields)
+        point_id = f"{tenant.org_id}:{tenant.workspace_id}:{document.chunk.chunk_id}"
+        point_payload = rest.PointStruct(  # type: ignore[arg-type]
+            id=point_id,
+            vector=document.vector,
+            payload=payload,
+        )
+        if document.sparse_vector:
+            point_payload.sparse_vector = rest.SparseVector(indices=list(document.sparse_vector.keys()), values=list(document.sparse_vector.values()))
+        return point_payload
+
+    def _build_filter(
+        self,
+        tenant: Tenant,
+        track: str,
+        filters: Dict[str, object] | None,
+    ):
+        from qdrant_client.http import models as rest
+
+        conditions = [
+            rest.FieldCondition(key="tenant_org", match=rest.MatchValue(value=tenant.org_id)),
+            rest.FieldCondition(key="tenant_workspace", match=rest.MatchValue(value=tenant.workspace_id)),
+            rest.FieldCondition(key="track", match=rest.MatchValue(value=track)),
+        ]
+        for key, value in (filters or {}).items():
+            if isinstance(value, (list, tuple, set)):
+                conditions.append(rest.FieldCondition(key=key, match=rest.MatchAny(any=list(value))))
+            else:
+                conditions.append(rest.FieldCondition(key=key, match=rest.MatchValue(value=value)))
+        return rest.Filter(must=conditions)
+
+
+def _chunk_to_payload(chunk: ChunkRecord) -> Dict[str, object]:
+    from dataclasses import asdict
+
+    payload = asdict(chunk)
+    payload["metadata"] = dict(chunk.metadata)
+    payload["key_terms"] = list(chunk.key_terms)
+    return payload
+
+
 def _matches_filters(metadata: Dict[str, object], filters: Dict[str, object]) -> bool:
     for key, value in filters.items():
         meta_value = metadata.get(key)
@@ -91,4 +246,4 @@ def _norm(vector: Sequence[float]) -> float:
     return math.sqrt(sum(value * value for value in vector))
 
 
-__all__ = ["VectorDocument", "VectorStoreClient", "InMemoryVectorStore"]
+__all__ = ["VectorDocument", "VectorStoreClient", "InMemoryVectorStore", "QdrantVectorStore"]
