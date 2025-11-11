@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import json
+import logging
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence
+from threading import RLock
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 from uuid import uuid4
 
 from ..acquisition.service import AcquisitionService
@@ -14,15 +17,17 @@ from .ingestion import IngestionService
 
 
 class IngestionJobStatus(str, Enum):
-    PENDING = "pending"
+    QUEUED = "queued"
     RUNNING = "running"
-    COMPLETED = "completed"
+    PARTIAL = "partial"
+    SUCCEEDED = "succeeded"
     FAILED = "failed"
 
 
 class DocumentStatus(str, Enum):
-    PENDING = "pending"
-    COMPLETED = "completed"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
     FAILED = "failed"
 
 
@@ -53,6 +58,11 @@ class JobDocumentResult:
 
 
 @dataclass(slots=True)
+class PersistedJobDocument(JobDocumentResult):
+    job_id: str | None = None
+
+
+@dataclass(slots=True)
 class IngestionJobRecord:
     job_id: str
     tenant_key: str
@@ -69,7 +79,21 @@ class IngestionJobStore:
     def create(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
         raise NotImplementedError
 
-    def update(self, record: IngestionJobRecord) -> None:
+    def mark_document_running(self, job_id: str, document_id: str) -> IngestionJobRecord:
+        raise NotImplementedError
+
+    def complete_document(self, job_id: str, document: JobDocumentResult) -> IngestionJobRecord:
+        raise NotImplementedError
+
+    def fail_document(
+        self,
+        job_id: str,
+        document_id: str,
+        error: str,
+        *,
+        metadata: Optional[Dict[str, object]] = None,
+        parser: str | None = None,
+    ) -> IngestionJobRecord:
         raise NotImplementedError
 
     def get(self, tenant: Tenant, job_id: str) -> IngestionJobRecord | None:
@@ -79,51 +103,545 @@ class IngestionJobStore:
         raise NotImplementedError
 
 
-class InMemoryIngestionJobStore(IngestionJobStore):
-    """Stores ingestion jobs in memory for development and tests."""
+class IngestionTaskDispatcher(Protocol):
+    def enqueue(
+        self,
+        job_id: str,
+        tenant: Tenant,
+        submission: DocumentSubmission,
+        *,
+        retry_intervals: Sequence[int] | None = None,
+    ) -> None:
+        ...
 
-    def __init__(self) -> None:
-        self._records: Dict[str, IngestionJobRecord] = {}
+
+class RedisPostgresIngestionJobStore(IngestionJobStore):
+    """Stores ingestion jobs in a relational database with Redis-backed status cache."""
+
+    def __init__(
+        self,
+        *,
+        connection: Any,
+        redis_client: Optional[object] = None,
+        namespace: str = "catalystindex",
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._connection = connection
+        self._redis = redis_client
+        self._namespace = namespace.rstrip(":") or "catalystindex"
+        self._logger = logger or logging.getLogger(__name__)
+        self._lock = RLock()
+        module_name = type(connection).__module__
+        self._placeholder = "%s" if "psycopg" in module_name else "?"
+        self._ensure_schema()
+
+    # -- public API -----------------------------------------------------
 
     def create(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
         job_id = uuid4().hex
+        tenant_key = _tenant_key(tenant)
         now = datetime.utcnow()
-        documents = [
-            JobDocumentResult(
+        now_iso = now.isoformat()
+        documents: List[PersistedJobDocument] = [
+            PersistedJobDocument(
+                job_id=job_id,
                 document_id=sub.document_id,
-                status=DocumentStatus.PENDING,
+                status=DocumentStatus.QUEUED,
                 policy=None,
                 chunk_count=0,
                 artifact_uri=None,
                 artifact_content_type=None,
                 parser=sub.parser_hint,
                 metadata=dict(sub.metadata),
+                error=None,
+                chunks=tuple(),
             )
             for sub in submissions
         ]
+        with self._lock:
+            self._execute(
+                """
+                INSERT INTO ingestion_jobs (job_id, tenant_key, status, created_at, updated_at, error)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    job_id,
+                    tenant_key,
+                    IngestionJobStatus.QUEUED.value,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            self._executemany(
+                """
+                INSERT INTO ingestion_job_documents (
+                    job_id,
+                    document_id,
+                    status,
+                    policy,
+                    chunk_count,
+                    artifact_uri,
+                    artifact_content_type,
+                    parser,
+                    metadata,
+                    error,
+                    chunks
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        job_id,
+                        doc.document_id,
+                        doc.status.value,
+                        doc.policy,
+                        doc.chunk_count,
+                        doc.artifact_uri,
+                        doc.artifact_content_type,
+                        doc.parser,
+                        _serialize_json(doc.metadata),
+                        None,
+                        _serialize_json([]),
+                    )
+                    for doc in documents
+                ],
+            )
+            self._connection.commit()
         record = IngestionJobRecord(
             job_id=job_id,
-            tenant_key=_tenant_key(tenant),
-            status=IngestionJobStatus.PENDING,
+            tenant_key=tenant_key,
+            status=IngestionJobStatus.QUEUED,
             created_at=now,
             updated_at=now,
-            documents=documents,
+            documents=[self._to_result(doc) for doc in documents],
+            error=None,
         )
-        self._records[job_id] = record
+        self._cache_job(record)
         return record
 
-    def update(self, record: IngestionJobRecord) -> None:
-        self._records[record.job_id] = record
+    def mark_document_running(self, job_id: str, document_id: str) -> IngestionJobRecord:
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._execute(
+                """
+                UPDATE ingestion_job_documents
+                SET status = ?, error = NULL
+                WHERE job_id = ? AND document_id = ?
+                """,
+                (DocumentStatus.RUNNING.value, job_id, document_id),
+            )
+            self._execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (IngestionJobStatus.RUNNING.value, now, job_id),
+            )
+            self._connection.commit()
+        record = self._refresh_job_status(job_id)
+        return record
+
+    def complete_document(self, job_id: str, document: JobDocumentResult) -> IngestionJobRecord:
+        now_iso = datetime.utcnow().isoformat()
+        with self._lock:
+            self._execute(
+                """
+                UPDATE ingestion_job_documents
+                SET
+                    status = ?,
+                    policy = ?,
+                    chunk_count = ?,
+                    artifact_uri = ?,
+                    artifact_content_type = ?,
+                    parser = ?,
+                    metadata = ?,
+                    error = NULL,
+                    chunks = ?
+                WHERE job_id = ? AND document_id = ?
+                """,
+                (
+                    DocumentStatus.SUCCEEDED.value,
+                    document.policy,
+                    document.chunk_count,
+                    document.artifact_uri,
+                    document.artifact_content_type,
+                    document.parser,
+                    _serialize_json(document.metadata),
+                    _serialize_chunks(document.chunks),
+                    job_id,
+                    document.document_id,
+                ),
+            )
+            self._execute(
+                """
+                UPDATE ingestion_jobs SET updated_at = ? WHERE job_id = ?
+                """,
+                (now_iso, job_id),
+            )
+            self._connection.commit()
+        record = self._refresh_job_status(job_id)
+        return record
+
+    def fail_document(
+        self,
+        job_id: str,
+        document_id: str,
+        error: str,
+        *,
+        metadata: Optional[Dict[str, object]] = None,
+        parser: str | None = None,
+    ) -> IngestionJobRecord:
+        now_iso = datetime.utcnow().isoformat()
+        existing = self._load_document(job_id, document_id)
+        metadata_payload = metadata if metadata is not None else existing.metadata
+        parser_value = parser or existing.parser
+        with self._lock:
+            self._execute(
+                """
+                UPDATE ingestion_job_documents
+                SET status = ?, error = ?, metadata = ?, parser = ?, chunks = ?
+                WHERE job_id = ? AND document_id = ?
+                """,
+                (
+                    DocumentStatus.FAILED.value,
+                    error,
+                    _serialize_json(metadata_payload),
+                    parser_value,
+                    _serialize_chunks(existing.chunks),
+                    job_id,
+                    document_id,
+                ),
+            )
+            self._execute(
+                """
+                UPDATE ingestion_jobs SET updated_at = ? WHERE job_id = ?
+                """,
+                (now_iso, job_id),
+            )
+            self._connection.commit()
+        record = self._refresh_job_status(job_id)
+        return record
 
     def get(self, tenant: Tenant, job_id: str) -> IngestionJobRecord | None:
-        record = self._records.get(job_id)
+        record = self._load_job(job_id)
         if record and record.tenant_key == _tenant_key(tenant):
             return record
         return None
 
     def list(self, tenant: Tenant) -> List[IngestionJobRecord]:
         tenant_key = _tenant_key(tenant)
-        return [record for record in self._records.values() if record.tenant_key == tenant_key]
+        cursor = self._execute(
+            """
+            SELECT job_id
+            FROM ingestion_jobs
+            WHERE tenant_key = ?
+            ORDER BY created_at DESC
+            """,
+            (tenant_key,),
+        )
+        job_ids = [row[0] for row in cursor.fetchall()]
+        return [self._load_job(job_id) for job_id in job_ids]
+
+    # -- internal helpers ----------------------------------------------
+
+    def _ensure_schema(self) -> None:
+        with self._lock:
+            self._execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    tenant_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error TEXT
+                )
+                """,
+            )
+            self._execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_job_documents (
+                    job_id TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    policy TEXT,
+                    chunk_count INTEGER,
+                    artifact_uri TEXT,
+                    artifact_content_type TEXT,
+                    parser TEXT,
+                    metadata TEXT,
+                    error TEXT,
+                    chunks TEXT,
+                    PRIMARY KEY (job_id, document_id)
+                )
+                """,
+            )
+            self._connection.commit()
+
+    def _refresh_job_status(self, job_id: str) -> IngestionJobRecord:
+        job_row = self._execute(
+            "SELECT tenant_key, created_at FROM ingestion_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job_row is None:
+            raise KeyError(f"job {job_id} not found")
+        tenant_key, created_at = job_row
+        documents = self._load_documents(job_id)
+        status_counts = {
+            status: sum(1 for doc in documents if doc.status == status)
+            for status in DocumentStatus
+        }
+        queued = status_counts[DocumentStatus.QUEUED]
+        running = status_counts[DocumentStatus.RUNNING]
+        succeeded = status_counts[DocumentStatus.SUCCEEDED]
+        failed = status_counts[DocumentStatus.FAILED]
+        total = queued + running + succeeded + failed
+        if total == 0 or queued == total:
+            job_status = IngestionJobStatus.QUEUED
+        elif running > 0 or queued > 0:
+            job_status = IngestionJobStatus.PARTIAL if failed > 0 else IngestionJobStatus.RUNNING
+        else:
+            if failed == 0:
+                job_status = IngestionJobStatus.SUCCEEDED
+            elif failed == total:
+                job_status = IngestionJobStatus.FAILED
+            else:
+                job_status = IngestionJobStatus.PARTIAL
+        updated_at = datetime.utcnow()
+        errors = [doc.error for doc in documents if doc.error]
+        error_value = "; ".join(errors) if errors else None
+        with self._lock:
+            self._execute(
+                """
+                UPDATE ingestion_jobs
+                SET status = ?, error = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    job_status.value,
+                    error_value,
+                    updated_at.isoformat(),
+                    job_id,
+                ),
+            )
+            self._connection.commit()
+        record = IngestionJobRecord(
+            job_id=job_id,
+            tenant_key=tenant_key,
+            status=job_status,
+            created_at=datetime.fromisoformat(created_at),
+            updated_at=updated_at,
+            documents=documents,
+            error=error_value,
+        )
+        self._cache_job(record)
+        return record
+
+    def _load_documents(self, job_id: str) -> List[JobDocumentResult]:
+        cursor = self._execute(
+            """
+            SELECT document_id, status, policy, chunk_count, artifact_uri,
+                   artifact_content_type, parser, metadata, error, chunks
+            FROM ingestion_job_documents
+            WHERE job_id = ?
+            ORDER BY document_id
+            """,
+            (job_id,),
+        )
+        documents: List[JobDocumentResult] = []
+        for row in cursor.fetchall():
+            (
+                document_id,
+                status,
+                policy,
+                chunk_count,
+                artifact_uri,
+                artifact_content_type,
+                parser,
+                metadata,
+                error,
+                chunks,
+            ) = row
+            documents.append(
+                JobDocumentResult(
+                    document_id=document_id,
+                    status=DocumentStatus(status),
+                    policy=policy,
+                    chunk_count=chunk_count or 0,
+                    artifact_uri=artifact_uri,
+                    artifact_content_type=artifact_content_type,
+                    parser=parser,
+                    metadata=_deserialize_json(metadata),
+                    error=error,
+                    chunks=_deserialize_chunks(chunks),
+                )
+            )
+        return documents
+
+    def _load_job(self, job_id: str) -> IngestionJobRecord | None:
+        cursor = self._execute(
+            """
+            SELECT tenant_key, status, created_at, updated_at, error
+            FROM ingestion_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        tenant_key, status, created_at, updated_at, error = row
+        documents = self._load_documents(job_id)
+        return IngestionJobRecord(
+            job_id=job_id,
+            tenant_key=tenant_key,
+            status=IngestionJobStatus(status),
+            created_at=datetime.fromisoformat(created_at),
+            updated_at=datetime.fromisoformat(updated_at),
+            documents=documents,
+            error=error,
+        )
+
+    def _load_document(self, job_id: str, document_id: str) -> JobDocumentResult:
+        cursor = self._execute(
+            """
+            SELECT status, policy, chunk_count, artifact_uri,
+                   artifact_content_type, parser, metadata, error, chunks
+            FROM ingestion_job_documents
+            WHERE job_id = ? AND document_id = ?
+            """,
+            (job_id, document_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise KeyError(f"document {document_id} not found in job {job_id}")
+        (
+            status,
+            policy,
+            chunk_count,
+            artifact_uri,
+            artifact_content_type,
+            parser,
+            metadata,
+            error,
+            chunks,
+        ) = row
+        return JobDocumentResult(
+            document_id=document_id,
+            status=DocumentStatus(status),
+            policy=policy,
+            chunk_count=chunk_count or 0,
+            artifact_uri=artifact_uri,
+            artifact_content_type=artifact_content_type,
+            parser=parser,
+            metadata=_deserialize_json(metadata),
+            error=error,
+            chunks=_deserialize_chunks(chunks),
+        )
+
+    def _execute(self, sql: str, parameters: Sequence[object] | None = None):
+        cursor = self._connection.cursor()
+        statement = self._prepare_sql(sql)
+        if parameters is None:
+            cursor.execute(statement)
+        else:
+            cursor.execute(statement, parameters)
+        return cursor
+
+    def _executemany(self, sql: str, seq_of_parameters: Sequence[Sequence[object]]):
+        cursor = self._connection.cursor()
+        statement = self._prepare_sql(sql)
+        cursor.executemany(statement, seq_of_parameters)
+        return cursor
+
+    def _prepare_sql(self, sql: str) -> str:
+        if self._placeholder == "?":
+            return sql
+        return sql.replace("?", self._placeholder)
+
+    def _to_result(self, document: PersistedJobDocument) -> JobDocumentResult:
+        return JobDocumentResult(
+            document_id=document.document_id,
+            status=document.status,
+            policy=document.policy,
+            chunk_count=document.chunk_count,
+            artifact_uri=document.artifact_uri,
+            artifact_content_type=document.artifact_content_type,
+            parser=document.parser,
+            metadata=dict(document.metadata),
+            error=document.error,
+            chunks=document.chunks,
+        )
+
+    def _cache_job(self, record: IngestionJobRecord) -> None:
+        if self._redis is None:
+            return
+        job_key = f"{self._namespace}:ingest:{record.job_id}"
+        mapping: Dict[str, str] = {
+            "status": record.status.value,
+            "updated_at": record.updated_at.isoformat(),
+        }
+        if record.error:
+            mapping["error"] = record.error
+        try:
+            self._redis.hset(job_key, mapping=mapping)
+            for document in record.documents:
+                doc_key = f"{job_key}:doc:{document.document_id}"
+                doc_mapping: Dict[str, str] = {
+                    "status": document.status.value,
+                    "chunk_count": str(document.chunk_count),
+                }
+                if document.error:
+                    doc_mapping["error"] = document.error
+                self._redis.hset(doc_key, mapping=doc_mapping)
+        except Exception:  # pragma: no cover - defensive logging
+            self._logger.debug("failed to push job state to redis", exc_info=True)
+
+
+def _serialize_json(payload: object) -> str:
+    try:
+        return json.dumps(payload)
+    except TypeError:
+        return json.dumps(json.loads(json.dumps(payload, default=str)))
+
+
+def _serialize_chunks(chunks: Sequence[ChunkRecord]) -> str:
+    if not chunks:
+        return _serialize_json([])
+    return json.dumps([asdict(chunk) for chunk in chunks])
+
+
+def _deserialize_json(raw: Any) -> Dict[str, object]:
+    if not raw:
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return value
+        return {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _deserialize_chunks(raw: Any) -> Sequence[ChunkRecord]:
+    if not raw:
+        return tuple()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return tuple()
+    if not isinstance(payload, list):
+        return tuple()
+    chunks: List[ChunkRecord] = []
+    for item in payload:
+        if isinstance(item, dict):
+            chunks.append(ChunkRecord(**item))
+    return tuple(chunks)
 
 
 def _tenant_key(tenant: Tenant) -> str:
@@ -143,6 +661,8 @@ class IngestionCoordinator:
         metrics: MetricsRecorder,
         audit_logger: AuditLogger,
         policy_resolver,
+        task_dispatcher: IngestionTaskDispatcher | None = None,
+        retry_intervals: Sequence[int] | None = None,
     ) -> None:
         self._ingestion_service = ingestion_service
         self._acquisition = acquisition
@@ -151,19 +671,41 @@ class IngestionCoordinator:
         self._metrics = metrics
         self._audit_logger = audit_logger
         self._resolve_policy = policy_resolver
+        self._task_dispatcher = task_dispatcher
+        self._retry_intervals = tuple(retry_intervals or (15, 30, 60, 120))
 
     def ingest_document(self, tenant: Tenant, submission: DocumentSubmission) -> IngestionJobRecord:
         record = self._job_store.create(tenant, [submission])
-        record = replace(record, status=IngestionJobStatus.RUNNING, updated_at=datetime.utcnow())
-        self._job_store.update(record)
-        record = self._process_documents(tenant, record, [submission])
+        record = self._job_store.mark_document_running(record.job_id, submission.document_id)
+        record = self._process_document(tenant, record.job_id, submission)
         return record
 
     def ingest_bulk(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
         record = self._job_store.create(tenant, submissions)
-        record = replace(record, status=IngestionJobStatus.RUNNING, updated_at=datetime.utcnow())
-        self._job_store.update(record)
-        record = self._process_documents(tenant, record, submissions)
+        if not submissions:
+            return record
+        if self._task_dispatcher:
+            for submission in submissions:
+                self._task_dispatcher.enqueue(
+                    record.job_id,
+                    tenant,
+                    submission,
+                    retry_intervals=self._retry_intervals,
+                )
+        else:
+            for submission in submissions:
+                record = self._job_store.mark_document_running(record.job_id, submission.document_id)
+                record = self._process_document(tenant, record.job_id, submission)
+        return record
+
+    def process_document_task(
+        self,
+        tenant: Tenant,
+        job_id: str,
+        submission: DocumentSubmission,
+    ) -> IngestionJobRecord:
+        record = self._job_store.mark_document_running(job_id, submission.document_id)
+        record = self._process_document(tenant, job_id, submission)
         return record
 
     def get_job(self, tenant: Tenant, job_id: str) -> IngestionJobRecord | None:
@@ -173,44 +715,30 @@ class IngestionCoordinator:
         records = self._job_store.list(tenant)
         return sorted(records, key=lambda record: record.created_at, reverse=True)
 
-    def _process_documents(
+    @property
+    def retry_intervals(self) -> Sequence[int]:
+        return self._retry_intervals
+
+    def _process_document(
         self,
         tenant: Tenant,
-        record: IngestionJobRecord,
-        submissions: Sequence[DocumentSubmission],
+        job_id: str,
+        submission: DocumentSubmission,
     ) -> IngestionJobRecord:
-        updated_documents: List[JobDocumentResult] = []
-        failures: List[str] = []
-        for submission in submissions:
-            try:
-                doc_result = self._process_single_document(tenant, record.job_id, submission)
-                updated_documents.append(doc_result)
-                if doc_result.status == DocumentStatus.FAILED and doc_result.error:
-                    failures.append(doc_result.error)
-            except Exception as exc:  # pragma: no cover - defensive guard
-                failures.append(str(exc))
-                updated_documents.append(
-                    JobDocumentResult(
-                        document_id=submission.document_id,
-                        status=DocumentStatus.FAILED,
-                        policy=None,
-                        chunk_count=0,
-                        artifact_uri=None,
-                        parser=submission.parser_hint,
-                        metadata=dict(submission.metadata),
-                        error=str(exc),
-                    )
-                )
-        status = IngestionJobStatus.COMPLETED if not failures else IngestionJobStatus.FAILED
-        record = replace(
-            record,
-            status=status,
-            updated_at=datetime.utcnow(),
-            error="; ".join(failures) if failures else None,
-            documents=updated_documents,
-        )
-        self._job_store.update(record)
-        self._metrics.record_ingestion_job(len(submissions), status=status.value)
+        try:
+            result = self._process_single_document(tenant, job_id, submission)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            record = self._job_store.fail_document(
+                job_id,
+                submission.document_id,
+                str(exc),
+                metadata=dict(submission.metadata),
+                parser=submission.parser_hint,
+            )
+            self._record_job_metrics_if_finished(record)
+            return record
+        record = self._job_store.complete_document(job_id, result)
+        self._record_job_metrics_if_finished(record)
         return record
 
     def _process_single_document(
@@ -267,7 +795,7 @@ class IngestionCoordinator:
         )
         return JobDocumentResult(
             document_id=submission.document_id,
-            status=DocumentStatus.COMPLETED,
+            status=DocumentStatus.SUCCEEDED,
             policy=ingestion_result.policy.policy_name,
             chunk_count=len(ingestion_result.chunks),
             artifact_uri=artifact.uri,
@@ -277,6 +805,19 @@ class IngestionCoordinator:
             chunks=ingestion_result.chunks,
         )
 
+    def _record_job_metrics_if_finished(self, job: IngestionJobRecord) -> None:
+        if job.status not in {
+            IngestionJobStatus.SUCCEEDED,
+            IngestionJobStatus.PARTIAL,
+            IngestionJobStatus.FAILED,
+        }:
+            return
+        if not job.documents:
+            return
+        if any(doc.status in {DocumentStatus.QUEUED, DocumentStatus.RUNNING} for doc in job.documents):
+            return
+        self._metrics.record_ingestion_job(len(job.documents), status=job.status.value)
+
 
 __all__ = [
     "DocumentStatus",
@@ -285,7 +826,8 @@ __all__ = [
     "IngestionJobRecord",
     "IngestionJobStatus",
     "IngestionJobStore",
-    "InMemoryIngestionJobStore",
+    "IngestionTaskDispatcher",
     "JobDocumentResult",
+    "RedisPostgresIngestionJobStore",
 ]
 

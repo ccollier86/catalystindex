@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 from functools import lru_cache
+from typing import Any
+
 from fastapi import Depends, Header, HTTPException, status
 
 from ..acquisition.service import AcquisitionService
@@ -13,7 +16,13 @@ from ..policies.resolver import resolve_policy
 from ..services.feedback import FeedbackService
 from ..services.generation import GenerationService
 from ..services.ingestion import IngestionService
-from ..services.ingestion_jobs import IngestionCoordinator, IngestionJobStore, InMemoryIngestionJobStore
+from ..services.ingestion_jobs import (
+    IngestionCoordinator,
+    IngestionJobStore,
+    IngestionTaskDispatcher,
+    RedisPostgresIngestionJobStore,
+)
+from ..workers.dispatcher import RQIngestionTaskDispatcher
 from ..services.search import EmbeddingReranker, SearchService
 from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
 from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
@@ -105,8 +114,64 @@ def get_artifact_store() -> ArtifactStore:
 
 
 @lru_cache
+def get_job_store_connection() -> Any:
+    settings = get_settings()
+    dsn = settings.jobs.store.postgres_dsn
+    if dsn.startswith("sqlite://"):
+        path = dsn[len("sqlite://") :]
+        database = path.lstrip("/") or ":memory:"
+        connection = sqlite3.connect(database, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
+    try:
+        import psycopg  # type: ignore
+    except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+        raise RuntimeError(
+            "Postgres DSN configured for ingestion jobs but 'psycopg' is not installed. Install optional dependencies.",
+        ) from exc
+    return psycopg.connect(dsn)
+
+
+@lru_cache
 def get_ingestion_job_store() -> IngestionJobStore:
-    return InMemoryIngestionJobStore()
+    settings = get_settings()
+    redis_client = None
+    redis_url = settings.jobs.store.redis_url
+    if redis_url:
+        try:
+            import redis  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - optional dependency
+            redis_client = None
+        else:
+            redis_client = redis.Redis.from_url(redis_url)
+    return RedisPostgresIngestionJobStore(
+        connection=get_job_store_connection(),
+        redis_client=redis_client,
+        namespace=settings.jobs.store.redis_namespace,
+    )
+
+
+@lru_cache
+def get_ingestion_task_dispatcher() -> IngestionTaskDispatcher | None:
+    settings = get_settings()
+    worker_settings = settings.jobs.worker
+    if not worker_settings.enabled:
+        return None
+    if not settings.jobs.store.redis_url:
+        raise RuntimeError("Ingestion worker dispatch requires a Redis URL to be configured.")
+    try:
+        dispatcher: IngestionTaskDispatcher = RQIngestionTaskDispatcher(
+            redis_url=settings.jobs.store.redis_url,
+            queue_name=worker_settings.queue_name,
+            default_timeout=worker_settings.default_timeout,
+            max_retries=worker_settings.max_retries,
+            retry_intervals=worker_settings.retry_intervals,
+        )
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError(
+            "Ingestion worker dispatch enabled but 'rq' is not installed. Install optional dependencies.",
+        ) from exc
+    return dispatcher
 
 
 @lru_cache
@@ -128,6 +193,7 @@ def get_ingestion_service() -> IngestionService:
 
 @lru_cache
 def get_ingestion_coordinator() -> IngestionCoordinator:
+    settings = get_settings()
     return IngestionCoordinator(
         ingestion_service=get_ingestion_service(),
         acquisition=get_acquisition_service(),
@@ -136,6 +202,8 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         metrics=get_metrics(),
         audit_logger=get_audit_logger(),
         policy_resolver=resolve_policy,
+        task_dispatcher=get_ingestion_task_dispatcher(),
+        retry_intervals=settings.jobs.worker.retry_intervals,
     )
 
 
