@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
+from importlib import import_module
+from importlib.util import find_spec
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from ..embeddings.base import EmbeddingProvider
 from ..models.common import RetrievalResult, Tenant
@@ -32,6 +36,7 @@ class TrackOptions:
     name: str
     limit: int | None = None
     filters: Dict[str, object] | None = None
+    use_sparse: bool = False
 
 
 @dataclass(slots=True)
@@ -69,6 +74,10 @@ class SearchService:
         audit_logger: AuditLogger,
         metrics: MetricsRecorder,
         reranker: "Reranker" | None = None,
+        economy_k: int = 10,
+        premium_k: int = 24,
+        enable_sparse_queries: bool = False,
+        premium_rerank_enabled: bool = True,
     ) -> None:
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -77,6 +86,10 @@ class SearchService:
         self._metrics = metrics
 
         self._reranker = reranker
+        self._economy_k = max(1, economy_k)
+        self._premium_k = max(self._economy_k, premium_k)
+        self._sparse_queries_enabled = enable_sparse_queries
+        self._premium_rerank_enabled = premium_rerank_enabled
 
     def retrieve(self, tenant: Tenant, *, query: str, options: SearchOptions | None = None) -> SearchExecution:
         options = options or SearchOptions()
@@ -85,9 +98,12 @@ class SearchService:
         analysis = self._analyze_query(query)
         expanded_query, alias_terms = self._expand_query(tenant, query, options)
         embedding = next(iter(self._embedding_provider.embed([expanded_query])))
-        limit = options.limit or (8 if normalized_mode != "premium" else 24)
-        track_options = self._resolve_tracks(options, analysis, default_limit=limit)
+        limit = options.limit or (self._economy_k if normalized_mode != "premium" else self._premium_k)
+        track_options = self._resolve_tracks(options, analysis, default_limit=limit, mode=normalized_mode)
         results_by_track: Dict[str, List[RetrievalResult]] = {}
+        sparse_query = None
+        if self._sparse_queries_enabled and normalized_mode == "premium":
+            sparse_query = self._build_sparse_query(expanded_query)
         for track in track_options:
             track_limit = track.limit or limit
             filters = self._merge_filters(options.filters, track.filters)
@@ -98,6 +114,7 @@ class SearchService:
                     track=track.name,
                     limit=track_limit,
                     filters=filters,
+                    sparse_vector=sparse_query if getattr(track, "use_sparse", False) else None,
                 )
             except Exception:
                 self._metrics.record_dependency_failure("qdrant")
@@ -106,7 +123,12 @@ class SearchService:
                 results_by_track[track.name] = results
 
         fused_results = self._fuse_results(results_by_track, limit)
-        if normalized_mode == "premium" and self._reranker and fused_results:
+        if (
+            normalized_mode == "premium"
+            and self._reranker
+            and self._premium_rerank_enabled
+            and fused_results
+        ):
             fused_results = list(self._reranker.rerank(expanded_query, fused_results, limit=limit))
         final_results = fused_results[:limit]
 
@@ -152,13 +174,59 @@ class SearchService:
         analysis: QueryAnalysis,
         *,
         default_limit: int,
+        mode: str,
     ) -> Tuple[TrackOptions, ...]:
         if options.tracks:
             return options.tracks
-        tracks: List[TrackOptions] = [TrackOptions(name="text", limit=default_limit)]
+        text_filters = self._filters_for_intent(analysis, track="text")
+        tracks: List[TrackOptions] = [
+            TrackOptions(
+                name="text",
+                limit=default_limit,
+                filters=text_filters,
+                use_sparse=self._sparse_queries_enabled and mode == "premium",
+            )
+        ]
         if analysis.requires_vision:
-            tracks.append(TrackOptions(name="vision", limit=max(default_limit // 2, 1)))
+            vision_filters = self._filters_for_intent(analysis, track="vision")
+            tracks.append(
+                TrackOptions(
+                    name="vision",
+                    limit=max(default_limit // 2, 1),
+                    filters=vision_filters,
+                    use_sparse=False,
+                )
+            )
         return tuple(tracks)
+
+    def _filters_for_intent(self, analysis: QueryAnalysis, *, track: str) -> Dict[str, object] | None:
+        tiers = self._chunk_tiers_for_intent(analysis.intent, track=track)
+        filters: Dict[str, object] = {}
+        if tiers:
+            filters["chunk_tier"] = tiers
+        if track == "text":
+            policy = self._policy_for_intent(analysis.intent)
+            if policy:
+                filters["policy"] = policy
+        return filters or None
+
+    def _chunk_tiers_for_intent(self, intent: str, *, track: str) -> Tuple[str, ...] | None:
+        if track == "vision":
+            return ("vision",)
+        mapping: Dict[str, Tuple[str, ...]] = {
+            "diagnosis_lookup": ("criteria", "semantic"),
+            "treatment_planning": ("semantic", "window"),
+            "vision_required": ("semantic", "window", "criteria"),
+            "general": ("semantic", "window", "criteria"),
+        }
+        return mapping.get(intent, mapping["general"])
+
+    def _policy_for_intent(self, intent: str) -> Tuple[str, ...] | None:
+        mapping: Dict[str, Tuple[str, ...]] = {
+            "diagnosis_lookup": ("dsm5",),
+            "treatment_planning": ("treatment_planner",),
+        }
+        return mapping.get(intent)
 
     def _analyze_query(self, query: str) -> QueryAnalysis:
         lowered = query.lower()
@@ -186,7 +254,26 @@ class SearchService:
             merged.update(base)
         if specific:
             merged.update(specific)
-        return merged
+        sanitized = {key: value for key, value in merged.items() if value is not None}
+        return sanitized or None
+
+    def _build_sparse_query(self, query: str) -> Dict[int, float] | None:
+        tokens = [token for token in query.lower().split() if token]
+        if not tokens:
+            return None
+        counts = Counter(tokens)
+        if not counts:
+            return None
+        max_count = max(counts.values())
+        if max_count <= 0:
+            return None
+        scale = 1.0 / float(max_count)
+        sparse_vector: Dict[int, float] = {}
+        for token, count in counts.items():
+            digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
+            index = int(digest[:8], 16) % 131071 or 1
+            sparse_vector[index] = float(count) * scale
+        return sparse_vector
 
     def _fuse_results(self, results: Mapping[str, Sequence[RetrievalResult]], limit: int) -> List[RetrievalResult]:
         if not results:
@@ -258,12 +345,145 @@ class EmbeddingReranker(Reranker):
         return [item[1] for item in rescored][:limit]
 
 
+class CohereReranker(Reranker):
+    """External reranker backed by Cohere's ReRank API."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        model: str | None = None,
+        top_n: int = 20,
+        client: Any | None = None,
+    ) -> None:
+        if client is None:
+            if not api_key:
+                raise ValueError("Cohere reranker requires an API key when client is not provided")
+            if find_spec("cohere") is None:
+                raise RuntimeError(
+                    "Cohere reranker requires the 'cohere' package. Install optional dependencies to enable it."
+                )
+            cohere_module = import_module("cohere")
+            client = cohere_module.Client(api_key)  # type: ignore[attr-defined]
+        self._client = client
+        self._model = model or "rerank-english-v3.0"
+        self._top_n = max(1, top_n)
+
+    def rerank(
+        self,
+        query: str,
+        results: Sequence[RetrievalResult],
+        *,
+        limit: int,
+    ) -> Iterable[RetrievalResult]:
+        if not results:
+            return []
+        documents = [result.chunk.summary or result.chunk.text for result in results]
+        response = self._client.rerank(  # type: ignore[attr-defined]
+            query=query,
+            documents=documents,
+            top_n=min(self._top_n, max(1, limit), len(documents)),
+            model=self._model,
+        )
+        reranked: List[RetrievalResult] = []
+        seen: set[int] = set()
+        for item in getattr(response, "results", []):
+            index = getattr(item, "index", None)
+            if index is None or index >= len(results):
+                continue
+            seen.add(index)
+            base = results[index]
+            score = float(getattr(item, "relevance_score", base.score))
+            reranked.append(
+                RetrievalResult(chunk=base.chunk, score=score, track=base.track, vision_context=base.vision_context)
+            )
+            if len(reranked) >= limit:
+                break
+        if len(reranked) < limit:
+            for idx, base in enumerate(results):
+                if idx in seen:
+                    continue
+                reranked.append(base)
+                if len(reranked) >= limit:
+                    break
+        return reranked[:limit]
+
+
+class OpenAIReranker(Reranker):
+    """External reranker that uses OpenAI embeddings for similarity scoring."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        model: str | None = None,
+        base_url: str | None = None,
+        weight: float = 0.5,
+        client: Any | None = None,
+    ) -> None:
+        if client is None:
+            if not api_key:
+                raise ValueError("OpenAI reranker requires an API key when client is not provided")
+            if find_spec("openai") is None:
+                raise RuntimeError(
+                    "OpenAI reranker requires the 'openai' package. Install optional dependencies to enable it."
+                )
+            openai_module = import_module("openai")
+            client = openai_module.OpenAI(api_key=api_key, base_url=base_url)  # type: ignore[attr-defined,call-arg]
+        self._client = client
+        self._model = model or "text-embedding-3-large"
+        self._weight = weight
+
+    def rerank(
+        self,
+        query: str,
+        results: Sequence[RetrievalResult],
+        *,
+        limit: int,
+    ) -> Iterable[RetrievalResult]:
+        if not results:
+            return []
+        documents = [result.chunk.summary or result.chunk.text for result in results]
+        query_embedding_response = self._client.embeddings.create(  # type: ignore[attr-defined]
+            model=self._model,
+            input=[query],
+        )
+        query_vector = query_embedding_response.data[0].embedding  # type: ignore[index]
+        document_embeddings_response = self._client.embeddings.create(  # type: ignore[attr-defined]
+            model=self._model,
+            input=documents,
+        )
+        document_vectors = [record.embedding for record in document_embeddings_response.data]  # type: ignore[attr-defined]
+        rescored: List[Tuple[float, RetrievalResult]] = []
+        for index, base in enumerate(results):
+            if index < len(document_vectors):
+                doc_vector = document_vectors[index]
+                similarity = _dot(query_vector, doc_vector)
+                combined = (1 - self._weight) * float(base.score) + self._weight * similarity
+            else:
+                combined = float(base.score)
+            rescored.append(
+                (
+                    combined,
+                    RetrievalResult(
+                        chunk=base.chunk,
+                        score=combined,
+                        track=base.track,
+                        vision_context=base.vision_context,
+                    ),
+                )
+            )
+        rescored.sort(key=lambda item: item[0], reverse=True)
+        return [item[1] for item in rescored][:limit]
+
 def _dot(left: Sequence[float], right: Sequence[float]) -> float:
     return float(sum(l * r for l, r in zip(left, right)))
 
 
 __all__ = [
+    "CohereReranker",
     "EmbeddingReranker",
+    "OpenAIReranker",
     "SearchDebugDetails",
     "SearchExecution",
     "SearchOptions",

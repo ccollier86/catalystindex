@@ -24,7 +24,7 @@ from ..services.ingestion_jobs import (
     RedisPostgresIngestionJobStore,
 )
 from ..workers.dispatcher import RQIngestionTaskDispatcher
-from ..services.search import EmbeddingReranker, SearchService
+from ..services.search import CohereReranker, EmbeddingReranker, OpenAIReranker, SearchService
 from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
 from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
@@ -232,15 +232,46 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
     )
 
 
+def _build_reranker(settings, embedding_provider):
+    reranker_config = settings.reranker
+    if not settings.features.enable_premium_rerank:
+        return None
+    provider = (reranker_config.provider or "").lower()
+    if not reranker_config.enabled or provider in ("embedding", "baseline"):
+        return EmbeddingReranker(embedding_provider, weight=reranker_config.weight)
+    if provider in ("none", "disabled"):
+        return None
+    if provider == "cohere":
+        return CohereReranker(
+            api_key=reranker_config.api_key,
+            model=reranker_config.model,
+            top_n=reranker_config.top_n,
+        )
+    if provider == "openai":
+        return OpenAIReranker(
+            api_key=reranker_config.api_key,
+            model=reranker_config.model,
+            base_url=reranker_config.base_url,
+            weight=reranker_config.weight,
+        )
+    raise ValueError(f"Unsupported reranker provider: {reranker_config.provider}")
+
+
 def get_search_service() -> SearchService:
+    settings = get_settings()
     embedding_provider = get_embedding_provider()
+    reranker = _build_reranker(settings, embedding_provider)
     return SearchService(
         embedding_provider=embedding_provider,
         vector_store=get_vector_store(),
         term_index=get_term_index(),
         audit_logger=get_audit_logger(),
         metrics=get_metrics(),
-        reranker=EmbeddingReranker(embedding_provider),
+        reranker=reranker,
+        economy_k=settings.storage.economy_max_k,
+        premium_k=settings.storage.premium_max_k,
+        enable_sparse_queries=settings.storage.qdrant.sparse_vectors,
+        premium_rerank_enabled=settings.features.enable_premium_rerank,
     )
 
 
