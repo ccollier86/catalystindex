@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Optional
+from typing import List
 
 from pydantic import BaseModel, Field
 
@@ -27,7 +27,6 @@ class RedisSettings(BaseModel):
     enabled: bool = False
     url: str = "redis://localhost:6379/0"
     ttl_seconds: int = 60 * 60 * 24 * 7
-
 
 class ArtifactSettings(BaseModel):
     backend: str = Field(default="local", description="Artifact backend (local or memory)")
