@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass(slots=True)
@@ -16,10 +16,42 @@ class Chunk:
 
 
 @dataclass(slots=True)
-class IngestionJob:
+class ArtifactRef:
+    uri: str
+    content_type: Optional[str]
+
+
+@dataclass(slots=True)
+class IngestionDocument:
     document_id: str
-    policy: str
+    status: str
+    policy: Optional[str]
+    chunk_count: int
+    parser: Optional[str]
+    artifact: Optional[ArtifactRef]
+    metadata: Dict[str, object]
     chunks: List[Chunk]
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class IngestionJob:
+    job_id: str
+    status: str
+    documents: List[IngestionDocument]
+    created_at: str
+    updated_at: str
+    error: Optional[str] = None
+
+
+@dataclass(slots=True)
+class IngestionJobSummary:
+    job_id: str
+    status: str
+    document_count: int
+    created_at: str
+    updated_at: str
+    error: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -38,4 +70,12 @@ class GenerationResult:
     chunk_count: int
 
 
-__all__ = ["Chunk", "IngestionJob", "SearchResult", "GenerationResult"]
+__all__ = [
+    "ArtifactRef",
+    "Chunk",
+    "IngestionDocument",
+    "IngestionJob",
+    "IngestionJobSummary",
+    "SearchResult",
+    "GenerationResult",
+]
