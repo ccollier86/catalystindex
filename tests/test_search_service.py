@@ -1,7 +1,7 @@
 from catalystindex.embeddings.hash import HashEmbeddingProvider
 from catalystindex.models.common import ChunkRecord, Tenant
 from catalystindex.services.search import SearchOptions, SearchService
-from catalystindex.storage.term_index import TermIndex
+from catalystindex.storage.term_index import InMemoryTermIndex
 from catalystindex.storage.vector_store import InMemoryVectorStore, VectorDocument
 from catalystindex.telemetry.logger import AuditLogger, MetricsRecorder
 
@@ -27,7 +27,7 @@ def build_chunk(chunk_id: str, text: str) -> ChunkRecord:
 def test_search_returns_results_sorted_by_score():
     embedding_provider = HashEmbeddingProvider(dimension=32)
     vector_store = InMemoryVectorStore()
-    term_index = TermIndex()
+    term_index = InMemoryTermIndex()
     service = SearchService(
         embedding_provider=embedding_provider,
         vector_store=vector_store,
@@ -42,7 +42,7 @@ def test_search_returns_results_sorted_by_score():
     ]
     for chunk in chunks:
         chunk.key_terms = ["post-traumatic stress"]
-        term_index.update("doc", chunk.chunk_id, chunk.key_terms)
+        term_index.update(tenant, "doc", chunk.chunk_id, chunk.key_terms)
     embeddings = list(embedding_provider.embed([chunk.text for chunk in chunks]))
     vector_store.upsert(
         tenant,

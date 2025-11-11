@@ -9,7 +9,7 @@ from ..storage.term_index import TermIndex
 from ..chunking.engine import ChunkingEngine
 from ..embeddings.base import EmbeddingProvider
 from ..models.common import ChunkRecord, SectionText, Tenant
-from ..parsers.base import ParserAdapter
+from ..parsers.registry import ParserRegistry
 from ..policies.resolver import ChunkingPolicy
 from ..storage.vector_store import VectorDocument, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
@@ -28,7 +28,7 @@ class IngestionService:
     def __init__(
         self,
         *,
-        parser: ParserAdapter,
+        parser_registry: ParserRegistry,
         chunking_engine: ChunkingEngine,
         embedding_provider: EmbeddingProvider,
         vector_store: VectorStoreClient,
@@ -36,7 +36,7 @@ class IngestionService:
         audit_logger: AuditLogger,
         metrics: MetricsRecorder,
     ) -> None:
-        self._parser = parser
+        self._parser_registry = parser_registry
         self._chunking_engine = chunking_engine
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -44,6 +44,7 @@ class IngestionService:
         self._audit_logger = audit_logger
         self._metrics = metrics
         self._embedding_cache: Dict[str, Sequence[float]] = {}
+        self._default_parser = "plain_text"
 
     def ingest(
         self,
@@ -53,10 +54,12 @@ class IngestionService:
         document_title: str,
         content: bytes | str,
         policy: ChunkingPolicy,
+        parser_name: str | None = None,
     ) -> IngestionResult:
-        sections: Iterable[SectionText] = self._parser.parse(content, document_title=document_title)
+        parser = self._parser_registry.resolve(parser_name or self._default_parser)
+        sections: Iterable[SectionText] = parser.parse(content, document_title=document_title)
         chunks = [
-            self._enrich_chunk(document_id, chunk, policy)
+            self._enrich_chunk(tenant, document_id, chunk, policy)
             for chunk in self._chunking_engine.generate_chunks(sections, policy, document_id)
         ]
         embeddings = self._embed_chunks(chunks)
@@ -76,7 +79,7 @@ class IngestionService:
                 self._embedding_cache[text] = vector
         return [self._embedding_cache[chunk.text] for chunk in chunks]
 
-    def _enrich_chunk(self, document_id: str, chunk: ChunkRecord, policy: ChunkingPolicy) -> ChunkRecord:
+    def _enrich_chunk(self, tenant: Tenant, document_id: str, chunk: ChunkRecord, policy: ChunkingPolicy) -> ChunkRecord:
         summary = _summarize(chunk.text, policy.llm_metadata.summary_length if policy.llm_metadata.enabled else 160)
         key_terms = _extract_key_terms(chunk.text, limit=policy.llm_metadata.max_terms)
         confidence_note = None
@@ -94,7 +97,7 @@ class IngestionService:
             metadata=metadata,
         )
         if key_terms:
-            self._term_index.update(document_id, chunk.chunk_id, key_terms)
+            self._term_index.update(tenant, document_id, chunk.chunk_id, key_terms)
         return enriched
 
 
