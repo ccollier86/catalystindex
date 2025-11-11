@@ -92,6 +92,7 @@ class BulkIngestResponse(BaseModel):
     submitted: int
     created_at: datetime
     updated_at: datetime
+    retry_intervals: List[int] | None = None
 
 
 class JobSummaryModel(BaseModel):
@@ -263,6 +264,7 @@ def ingest_bulk(
         submitted=len(submissions),
         created_at=job.created_at,
         updated_at=job.updated_at,
+        retry_intervals=list(coordinator.retry_intervals),
     )
 
 
@@ -417,7 +419,7 @@ __all__ = ["router"]
 def _document_to_model(result: object) -> DocumentResultModel:
     if isinstance(result, DocumentResultModel):  # pragma: no cover - defensive
         return result
-    status_value = getattr(result, "status", DocumentStatus.PENDING)
+    status_value = getattr(result, "status", DocumentStatus.QUEUED)
     if isinstance(status_value, DocumentStatus):
         status_str = status_value.value
     else:
