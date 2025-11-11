@@ -3,21 +3,21 @@ import pytest
 from catalystindex.chunking.engine import ChunkingEngine
 from catalystindex.embeddings.hash import HashEmbeddingProvider
 from catalystindex.models.common import Tenant
-from catalystindex.parsers.base import PlainTextParser
+from catalystindex.parsers.registry import default_registry
 from catalystindex.policies.resolver import resolve_policy
 from catalystindex.services.ingestion import IngestionService
-from catalystindex.storage.term_index import TermIndex
+from catalystindex.storage.term_index import InMemoryTermIndex
 from catalystindex.storage.vector_store import InMemoryVectorStore
 from catalystindex.telemetry.logger import AuditLogger, MetricsRecorder
 
 
 def test_ingestion_generates_chunks():
     service = IngestionService(
-        parser=PlainTextParser(),
+        parser_registry=default_registry(),
         chunking_engine=ChunkingEngine(namespace="test"),
         embedding_provider=HashEmbeddingProvider(dimension=64),
         vector_store=InMemoryVectorStore(),
-        term_index=TermIndex(),
+        term_index=InMemoryTermIndex(),
         audit_logger=AuditLogger(),
         metrics=MetricsRecorder(),
     )

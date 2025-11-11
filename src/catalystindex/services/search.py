@@ -39,7 +39,7 @@ class SearchService:
 
     def retrieve(self, tenant: Tenant, *, query: str, options: SearchOptions | None = None) -> List[RetrievalResult]:
         options = options or SearchOptions()
-        expanded_query = self._expand_query(query, options)
+        expanded_query = self._expand_query(tenant, query, options)
         embedding = next(iter(self._embedding_provider.embed([expanded_query])))
         limit = options.limit
         results = self._vector_store.query(
@@ -53,10 +53,10 @@ class SearchService:
         self._audit_logger.search_executed(tenant, query=expanded_query, result_count=len(results))
         return results
 
-    def _expand_query(self, query: str, options: SearchOptions) -> str:
+    def _expand_query(self, tenant: Tenant, query: str, options: SearchOptions) -> str:
         if not self._term_index:
             return query
-        aliases = self._term_index.expand_query(query, limit=options.alias_limit)
+        aliases = self._term_index.expand_query(tenant, query, limit=options.alias_limit)
         if not aliases:
             return query
         alias_text = " ".join(sorted(set(aliases)))
