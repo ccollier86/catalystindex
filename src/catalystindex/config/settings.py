@@ -50,12 +50,32 @@ class FeatureFlags(BaseModel):
     enable_metrics: bool = True
 
 
+class JobStoreSettings(BaseModel):
+    postgres_dsn: str = Field(default="sqlite:///:memory:", description="DSN for ingestion job store")
+    redis_url: str | None = Field(default=None, description="Redis URL for job state caching")
+    redis_namespace: str = Field(default="catalystindex", description="Redis key namespace")
+
+
+class JobWorkerSettings(BaseModel):
+    enabled: bool = Field(default=False, description="Enable background worker dispatch")
+    queue_name: str = Field(default="ingestion", description="RQ queue name for ingestion tasks")
+    default_timeout: int = Field(default=900, description="Default timeout (seconds) for ingestion tasks")
+    max_retries: int = Field(default=3, description="Maximum retry attempts for ingestion tasks")
+    retry_intervals: List[int] = Field(default_factory=lambda: [15, 30, 60, 120])
+
+
+class JobSettings(BaseModel):
+    store: JobStoreSettings = Field(default_factory=JobStoreSettings)
+    worker: JobWorkerSettings = Field(default_factory=JobWorkerSettings)
+
+
 class AppSettings(BaseModel):
     environment: str = "dev"
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     features: FeatureFlags = Field(default_factory=FeatureFlags)
     telemetry_namespace: str = "catalystindex"
+    jobs: JobSettings = Field(default_factory=JobSettings)
 
 
 @lru_cache
