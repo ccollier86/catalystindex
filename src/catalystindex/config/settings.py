@@ -69,6 +69,17 @@ class StorageSettings(BaseModel):
 class FeatureFlags(BaseModel):
     enable_generation: bool = True
     enable_metrics: bool = True
+    enable_premium_rerank: bool = True
+
+
+class RerankerSettings(BaseModel):
+    enabled: bool = Field(default=False, description="Enable external reranker for premium mode")
+    provider: str = Field(default="embedding", description="Reranker provider (embedding, cohere, openai)")
+    model: str | None = Field(default=None, description="Model identifier for the reranker provider")
+    api_key: str | None = Field(default=None, description="API key used by the reranker provider")
+    base_url: str | None = Field(default=None, description="Optional base URL override for OpenAI-compatible rerankers")
+    top_n: int = Field(default=20, description="Maximum number of documents sent to the reranker")
+    weight: float = Field(default=0.3, description="Weight assigned when blending reranker scores")
 
 
 class JobStoreSettings(BaseModel):
@@ -95,6 +106,7 @@ class AppSettings(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     features: FeatureFlags = Field(default_factory=FeatureFlags)
+    reranker: RerankerSettings = Field(default_factory=RerankerSettings)
     telemetry_namespace: str = "catalystindex"
     jobs: JobSettings = Field(default_factory=JobSettings)
     acquisition: AcquisitionSettings = Field(default_factory=AcquisitionSettings)
