@@ -10,8 +10,8 @@ from ..parsers.registry import default_registry
 from ..services.generation import GenerationService
 from ..services.ingestion import IngestionService
 from ..services.search import SearchService
-from ..storage.term_index import TermIndex
-from ..storage.vector_store import InMemoryVectorStore
+from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
+from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from ..chunking.engine import ChunkingEngine
 
@@ -27,13 +27,51 @@ def get_audit_logger() -> AuditLogger:
 
 
 @lru_cache
-def get_vector_store() -> InMemoryVectorStore:
+def get_vector_store() -> VectorStoreClient:
+    settings = get_settings()
+    backend = settings.storage.vector_backend.lower()
+    qdrant_enabled = backend == "qdrant" or settings.storage.qdrant.enabled
+    if qdrant_enabled:
+        try:
+            from qdrant_client import QdrantClient  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "Qdrant backend requested but 'qdrant-client' is not installed. Install optional dependencies."
+            ) from exc
+        qdrant_settings = settings.storage.qdrant
+        client = QdrantClient(
+            host=qdrant_settings.host,
+            port=qdrant_settings.port,
+            grpc_port=qdrant_settings.grpc_port,
+            api_key=qdrant_settings.api_key,
+            prefer_grpc=qdrant_settings.prefer_grpc,
+        )
+        return QdrantVectorStore(
+            client,
+            collection_prefix=qdrant_settings.collection_prefix,
+            vector_size=settings.storage.vector_dimension,
+            sparse_enabled=qdrant_settings.sparse_vectors,
+            metadata_fields={"environment": settings.environment},
+        )
     return InMemoryVectorStore()
 
 
 @lru_cache
 def get_term_index() -> TermIndex:
-    return TermIndex()
+    settings = get_settings()
+    backend = settings.storage.term_index_backend.lower()
+    redis_enabled = backend == "redis" or settings.storage.redis.enabled
+    if redis_enabled:
+        try:
+            import redis  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "Redis backend requested but 'redis' package is not installed. Install optional dependencies."
+            ) from exc
+        redis_settings = settings.storage.redis
+        client = redis.Redis.from_url(redis_settings.url)
+        return RedisTermIndex(client, ttl_seconds=redis_settings.ttl_seconds)
+    return InMemoryTermIndex()
 
 
 @lru_cache
@@ -53,10 +91,8 @@ def get_parser_registry():
 
 
 def get_ingestion_service() -> IngestionService:
-    registry = get_parser_registry()
-    parser = registry.resolve("plain_text")
     return IngestionService(
-        parser=parser,
+        parser_registry=get_parser_registry(),
         chunking_engine=get_chunking_engine(),
         embedding_provider=get_embedding_provider(),
         vector_store=get_vector_store(),

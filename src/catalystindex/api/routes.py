@@ -103,6 +103,7 @@ def ingest_document(
         document_title=request.document_title,
         content=request.content,
         policy=policy,
+        parser_name=request.parser,
     )
     return IngestResponse(
         document_id=result.document_id,
