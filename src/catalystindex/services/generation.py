@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Dict, List
 
 from ..models.common import RetrievalResult, Tenant
@@ -26,8 +27,9 @@ class GenerationService:
     def summarize(self, tenant: Tenant, *, query: str, limit: int = 6) -> GenerationResponse:
         from .search import SearchOptions
 
-        results = self._search_service.retrieve(tenant, query=query, options=SearchOptions(limit=limit))
-        limited = results[:limit]
+        start = perf_counter()
+        execution = self._search_service.retrieve(tenant, query=query, options=SearchOptions(limit=limit))
+        limited = execution.results[:limit]
         summary_lines = []
         citations: Dict[str, Dict[str, object]] = {}
         for index, result in enumerate(limited, start=1):
@@ -41,7 +43,8 @@ class GenerationService:
                 "pages": f"{chunk.start_page}-{chunk.end_page}",
             }
         summary = "\n\n".join(summary_lines)
-        self._metrics.record_generation()
+        duration_ms = (perf_counter() - start) * 1000.0
+        self._metrics.record_generation(latency_ms=duration_ms)
         self._audit_logger.generation_completed(tenant, query=query, chunk_ids=citations)
         return GenerationResponse(query=query, summary=summary, citations=citations, results=limited)
 
