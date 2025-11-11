@@ -93,6 +93,7 @@ def test_ingestion_coordinator_creates_job():
     assert document.metadata["source_type"] == "inline"
     assert document.metadata["source_label"] == "unit-test"
     assert document.artifact_uri is not None
+    assert document.artifact_metadata["payload_size"] > 0
 
 
 def test_ingest_bulk_enqueues_tasks():
