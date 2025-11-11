@@ -30,6 +30,7 @@ class VectorStoreClient:
         track: str,
         limit: int,
         filters: Dict[str, object] | None = None,
+        sparse_vector: Mapping[int, float] | None = None,
     ) -> List[RetrievalResult]:
         raise NotImplementedError
 
@@ -55,6 +56,7 @@ class InMemoryVectorStore(VectorStoreClient):
         track: str,
         limit: int,
         filters: Dict[str, object] | None = None,
+        sparse_vector: Mapping[int, float] | None = None,
     ) -> List[RetrievalResult]:
         docs = self._store.get(self._key(tenant), [])
         if not docs:
@@ -63,7 +65,7 @@ class InMemoryVectorStore(VectorStoreClient):
         for doc in docs:
             if doc.track != track:
                 continue
-            if filters and not _matches_filters(doc.chunk.metadata, filters):
+            if filters and not _matches_filters(doc.chunk, filters):
                 continue
             denom = float(_norm(doc.vector) * _norm(vector))
             score = _dot(doc.vector, vector) / denom if not math.isclose(denom, 0.0) else 0.0
@@ -122,19 +124,29 @@ class QdrantVectorStore(VectorStoreClient):
         track: str,
         limit: int,
         filters: Dict[str, object] | None = None,
+        sparse_vector: Mapping[int, float] | None = None,
     ) -> List[RetrievalResult]:
         collection = self._collection_name(track)
         if not self._collection_exists(collection):
             return []
         qdrant_filter = self._build_filter(tenant, track, filters)
         search_params = self._rest.SearchParams(exact=False)
-        results = self._client.search(
-            collection_name=collection,
-            query_vector=vector,
-            query_filter=qdrant_filter,
-            limit=limit,
-            search_params=search_params,
-        )
+        search_kwargs = {
+            "collection_name": collection,
+            "query_vector": vector,
+            "query_filter": qdrant_filter,
+            "limit": limit,
+            "search_params": search_params,
+        }
+        if sparse_vector and self._sparse_enabled:
+            sparse_class = getattr(self._rest, "SparseVector", None)
+            if sparse_class is None:
+                raise RuntimeError("Sparse vector queries require qdrant-client with sparse vector support enabled.")
+            search_kwargs["query_sparse_vector"] = sparse_class(
+                indices=list(sparse_vector.keys()),
+                values=list(sparse_vector.values()),
+            )
+        results = self._client.search(**search_kwargs)
         retrievals: List[RetrievalResult] = []
         for point in results:
             payload = point.payload or {}
@@ -161,10 +173,19 @@ class QdrantVectorStore(VectorStoreClient):
         if self._collection_exists(collection):
             return
         vectors_config = self._rest.VectorParams(size=self._vector_size, distance=self._rest.Distance.COSINE)
+        sparse_config = None
+        if self._sparse_enabled:
+            sparse_params = getattr(self._rest, "SparseVectorParams", None)
+            if sparse_params is None:
+                raise RuntimeError("Sparse vectors requested but qdrant-client does not support them.")
+            index_params = getattr(self._rest, "SparseIndexParams", None)
+            sparse_config = (
+                sparse_params(index=index_params(on_disk=False)) if index_params else sparse_params()
+            )
         self._client.create_collection(
             collection_name=collection,
             vectors_config=vectors_config,
-            sparse_vectors_config=None,
+            sparse_vectors_config=sparse_config,
         )
 
     def _collection_exists(self, collection: str) -> bool:
@@ -186,6 +207,9 @@ class QdrantVectorStore(VectorStoreClient):
             "section_slug": document.chunk.section_slug,
             "vision_context": document.chunk.metadata.get("vision"),
         }
+        policy = document.chunk.metadata.get("policy")
+        if policy:
+            payload["policy"] = policy
         payload.update(self._metadata_fields)
         point_id = f"{tenant.org_id}:{tenant.workspace_id}:{document.chunk.chunk_id}"
         point_payload = rest.PointStruct(  # type: ignore[arg-type]
@@ -193,8 +217,14 @@ class QdrantVectorStore(VectorStoreClient):
             vector=document.vector,
             payload=payload,
         )
-        if document.sparse_vector:
-            point_payload.sparse_vector = rest.SparseVector(indices=list(document.sparse_vector.keys()), values=list(document.sparse_vector.values()))
+        if document.sparse_vector and self._sparse_enabled:
+            sparse_class = getattr(rest, "SparseVector", None)
+            if sparse_class is None:
+                raise RuntimeError("Sparse vectors requested but qdrant-client does not support them.")
+            point_payload.sparse_vector = sparse_class(
+                indices=list(document.sparse_vector.keys()),
+                values=list(document.sparse_vector.values()),
+            )
         return point_payload
 
     def _build_filter(
@@ -211,6 +241,8 @@ class QdrantVectorStore(VectorStoreClient):
             rest.FieldCondition(key="track", match=rest.MatchValue(value=track)),
         ]
         for key, value in (filters or {}).items():
+            if value is None:
+                continue
             if isinstance(value, (list, tuple, set)):
                 conditions.append(rest.FieldCondition(key=key, match=rest.MatchAny(any=list(value))))
             else:
@@ -227,13 +259,18 @@ def _chunk_to_payload(chunk: ChunkRecord) -> Dict[str, object]:
     return payload
 
 
-def _matches_filters(metadata: Dict[str, object], filters: Dict[str, object]) -> bool:
+def _matches_filters(chunk: ChunkRecord, filters: Dict[str, object]) -> bool:
     for key, value in filters.items():
-        meta_value = metadata.get(key)
+        if key == "chunk_tier":
+            candidate = chunk.chunk_tier
+        elif key == "policy":
+            candidate = chunk.metadata.get("policy")
+        else:
+            candidate = chunk.metadata.get(key)
         if isinstance(value, (list, tuple, set)):
-            if meta_value not in value:
+            if candidate not in value:
                 return False
-        elif str(meta_value) != str(value):
+        elif str(candidate) != str(value):
             return False
     return True
 
