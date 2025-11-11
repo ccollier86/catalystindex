@@ -19,6 +19,7 @@ class Chunk:
 class ArtifactRef:
     uri: str
     content_type: Optional[str]
+    metadata: Dict[str, object]
 
 
 @dataclass(slots=True)

@@ -191,6 +191,7 @@ class CatalystIndexClient:
             artifact = ArtifactRef(
                 uri=artifact_payload.get("uri"),
                 content_type=artifact_payload.get("content_type"),
+                metadata=artifact_payload.get("metadata", {}),
             )
         chunks = [self._parse_chunk(item) for item in payload.get("chunks", [])]
         return IngestionDocument(
