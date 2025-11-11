@@ -12,10 +12,37 @@ class SecuritySettings(BaseModel):
     required_scopes: List[str] = Field(default_factory=list, description="Scopes required for the active endpoint")
 
 
+class QdrantSettings(BaseModel):
+    enabled: bool = False
+    host: str = "localhost"
+    port: int = 6333
+    grpc_port: int | None = None
+    api_key: str | None = None
+    collection_prefix: str = "catalystindex"
+    prefer_grpc: bool = False
+    sparse_vectors: bool = False
+
+
+class RedisSettings(BaseModel):
+    enabled: bool = False
+    url: str = "redis://localhost:6379/0"
+    ttl_seconds: int = 60 * 60 * 24 * 7
+
+
+class ArtifactSettings(BaseModel):
+    backend: str = Field(default="local", description="Artifact backend (local or memory)")
+    base_path: str = Field(default="artifacts", description="Filesystem path for local artifact storage")
+
+
 class StorageSettings(BaseModel):
     vector_dimension: int = 128
     premium_max_k: int = 24
     economy_max_k: int = 10
+    vector_backend: str = Field(default="memory", description="Vector store backend (memory or qdrant)")
+    qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
+    term_index_backend: str = Field(default="memory", description="Term index backend (memory or redis)")
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    artifacts: ArtifactSettings = Field(default_factory=ArtifactSettings)
 
 
 class FeatureFlags(BaseModel):

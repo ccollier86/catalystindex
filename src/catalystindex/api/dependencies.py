@@ -3,15 +3,19 @@ from __future__ import annotations
 from functools import lru_cache
 from fastapi import Depends, Header, HTTPException, status
 
+from ..acquisition.service import AcquisitionService
+from ..artifacts.store import ArtifactStore, InMemoryArtifactStore, LocalArtifactStore
 from ..auth.jwt import decode_jwt, ensure_scopes, extract_tenant
 from ..config.settings import get_settings
 from ..embeddings.hash import HashEmbeddingProvider
 from ..parsers.registry import default_registry
+from ..policies.resolver import resolve_policy
 from ..services.generation import GenerationService
 from ..services.ingestion import IngestionService
-from ..services.search import SearchService
-from ..storage.term_index import TermIndex
-from ..storage.vector_store import InMemoryVectorStore
+from ..services.ingestion_jobs import IngestionCoordinator, IngestionJobStore, InMemoryIngestionJobStore
+from ..services.search import EmbeddingReranker, SearchService
+from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
+from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from ..chunking.engine import ChunkingEngine
 
@@ -27,13 +31,51 @@ def get_audit_logger() -> AuditLogger:
 
 
 @lru_cache
-def get_vector_store() -> InMemoryVectorStore:
+def get_vector_store() -> VectorStoreClient:
+    settings = get_settings()
+    backend = settings.storage.vector_backend.lower()
+    qdrant_enabled = backend == "qdrant" or settings.storage.qdrant.enabled
+    if qdrant_enabled:
+        try:
+            from qdrant_client import QdrantClient  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "Qdrant backend requested but 'qdrant-client' is not installed. Install optional dependencies."
+            ) from exc
+        qdrant_settings = settings.storage.qdrant
+        client = QdrantClient(
+            host=qdrant_settings.host,
+            port=qdrant_settings.port,
+            grpc_port=qdrant_settings.grpc_port,
+            api_key=qdrant_settings.api_key,
+            prefer_grpc=qdrant_settings.prefer_grpc,
+        )
+        return QdrantVectorStore(
+            client,
+            collection_prefix=qdrant_settings.collection_prefix,
+            vector_size=settings.storage.vector_dimension,
+            sparse_enabled=qdrant_settings.sparse_vectors,
+            metadata_fields={"environment": settings.environment},
+        )
     return InMemoryVectorStore()
 
 
 @lru_cache
 def get_term_index() -> TermIndex:
-    return TermIndex()
+    settings = get_settings()
+    backend = settings.storage.term_index_backend.lower()
+    redis_enabled = backend == "redis" or settings.storage.redis.enabled
+    if redis_enabled:
+        try:
+            import redis  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "Redis backend requested but 'redis' package is not installed. Install optional dependencies."
+            ) from exc
+        redis_settings = settings.storage.redis
+        client = redis.Redis.from_url(redis_settings.url)
+        return RedisTermIndex(client, ttl_seconds=redis_settings.ttl_seconds)
+    return InMemoryTermIndex()
 
 
 @lru_cache
@@ -52,11 +94,28 @@ def get_parser_registry():
     return default_registry()
 
 
+@lru_cache
+def get_artifact_store() -> ArtifactStore:
+    settings = get_settings()
+    backend = settings.storage.artifacts.backend.lower()
+    if backend == "memory":
+        return InMemoryArtifactStore()
+    return LocalArtifactStore(settings.storage.artifacts.base_path)
+
+
+@lru_cache
+def get_ingestion_job_store() -> IngestionJobStore:
+    return InMemoryIngestionJobStore()
+
+
+@lru_cache
+def get_acquisition_service() -> AcquisitionService:
+    return AcquisitionService()
+
+
 def get_ingestion_service() -> IngestionService:
-    registry = get_parser_registry()
-    parser = registry.resolve("plain_text")
     return IngestionService(
-        parser=parser,
+        parser_registry=get_parser_registry(),
         chunking_engine=get_chunking_engine(),
         embedding_provider=get_embedding_provider(),
         vector_store=get_vector_store(),
@@ -66,13 +125,28 @@ def get_ingestion_service() -> IngestionService:
     )
 
 
+@lru_cache
+def get_ingestion_coordinator() -> IngestionCoordinator:
+    return IngestionCoordinator(
+        ingestion_service=get_ingestion_service(),
+        acquisition=get_acquisition_service(),
+        artifact_store=get_artifact_store(),
+        job_store=get_ingestion_job_store(),
+        metrics=get_metrics(),
+        audit_logger=get_audit_logger(),
+        policy_resolver=resolve_policy,
+    )
+
+
 def get_search_service() -> SearchService:
+    embedding_provider = get_embedding_provider()
     return SearchService(
-        embedding_provider=get_embedding_provider(),
+        embedding_provider=embedding_provider,
         vector_store=get_vector_store(),
         term_index=get_term_index(),
         audit_logger=get_audit_logger(),
         metrics=get_metrics(),
+        reranker=EmbeddingReranker(embedding_provider),
     )
 
 
@@ -105,6 +179,7 @@ def require_scopes(*scopes: str):
 
 __all__ = [
     "get_ingestion_service",
+    "get_ingestion_coordinator",
     "get_search_service",
     "get_generation_service",
     "require_scopes",

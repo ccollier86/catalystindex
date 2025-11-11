@@ -26,8 +26,8 @@ class GenerationService:
     def summarize(self, tenant: Tenant, *, query: str, limit: int = 6) -> GenerationResponse:
         from .search import SearchOptions
 
-        results = self._search_service.retrieve(tenant, query=query, options=SearchOptions(limit=limit))
-        limited = results[:limit]
+        execution = self._search_service.retrieve(tenant, query=query, options=SearchOptions(limit=limit))
+        limited = execution.results[:limit]
         summary_lines = []
         citations: Dict[str, Dict[str, object]] = {}
         for index, result in enumerate(limited, start=1):
