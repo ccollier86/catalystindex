@@ -76,6 +76,12 @@ class IngestionService:
         ]
         self._vector_store.upsert(tenant, documents)
         self._metrics.record_ingestion(len(chunks))
+        self._audit_logger.ingest_completed(
+            tenant,
+            document_id=document_id,
+            chunk_count=len(chunks),
+            policy=policy.policy_name,
+        )
         return IngestionResult(document_id=document_id, policy=policy, chunks=tuple(chunks))
 
     def _embed_chunks(self, chunks: Sequence[ChunkRecord]) -> Sequence[Sequence[float]]:
@@ -92,7 +98,7 @@ class IngestionService:
         chunk: ChunkRecord,
         policy: ChunkingPolicy,
         *,
-        document_metadata: Dict[str, object],
+        document_metadata: Dict[str, object] | None = None,
     ) -> ChunkRecord:
         summary = _summarize(chunk.text, policy.llm_metadata.summary_length if policy.llm_metadata.enabled else 160)
         key_terms = _extract_key_terms(chunk.text, limit=policy.llm_metadata.max_terms)
@@ -100,7 +106,8 @@ class IngestionService:
         if len(chunk.text.split()) > policy.max_chunk_tokens:
             confidence_note = "chunk exceeds policy token limit"
         metadata = dict(chunk.metadata)
-        metadata.update(document_metadata)
+        if document_metadata:
+            metadata.update(document_metadata)
         metadata.update(
             {
                 "summary_model": policy.llm_metadata.model if policy.llm_metadata.enabled else "heuristic",
