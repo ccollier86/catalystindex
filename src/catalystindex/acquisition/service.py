@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Protocol, runtime_checkable
 
 
 @dataclass(slots=True)
@@ -17,8 +15,25 @@ class AcquisitionResult:
     metadata: Dict[str, object]
 
 
+@runtime_checkable
+class URLFetcher(Protocol):
+    """Protocol describing URL-based acquisition backends."""
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        metadata: Dict[str, object] | None = None,
+        parser_hint: str | None = None,
+    ) -> AcquisitionResult:
+        ...
+
+
 class AcquisitionService:
     """Fetches document sources from uploads, URLs, or inline payloads."""
+
+    def __init__(self, url_fetcher: URLFetcher | None = None) -> None:
+        self._url_fetcher = url_fetcher
 
     def acquire(
         self,
@@ -46,28 +61,17 @@ class AcquisitionService:
         if normalized_type == "url":
             if not content_uri:
                 raise ValueError("URL sources must provide content_uri")
-            try:
-                with urllib.request.urlopen(content_uri) as response:  # nosec - trusted runtime configuration
-                    body = response.read()
-                    content_type = response.headers.get_content_type()
-            except urllib.error.URLError as exc:
-                raise RuntimeError(f"Failed to fetch content from {content_uri}: {exc.reason}") from exc
-            metadata.update({"source_type": normalized_type, "fetched_uri": content_uri})
-            inferred_parser = parser_hint
-            if not inferred_parser and content_type:
-                if "html" in content_type:
-                    inferred_parser = "html"
-                elif "pdf" in content_type:
-                    inferred_parser = "pdf"
-            return AcquisitionResult(
-                content=body,
-                content_type=content_type,
-                source_uri=content_uri,
-                parser_hint=inferred_parser,
-                metadata=metadata,
-            )
+            fetcher = self._url_fetcher
+            if fetcher is None:
+                raise RuntimeError("URL acquisition requested but no URL fetcher is configured")
+            result = fetcher.fetch(content_uri, metadata=metadata, parser_hint=parser_hint)
+            result.metadata.setdefault("source_type", normalized_type)
+            result.metadata.setdefault("fetched_uri", content_uri)
+            if result.source_uri is None:
+                result.source_uri = content_uri
+            return result
         raise ValueError(f"Unsupported source_type '{source_type}'")
 
 
-__all__ = ["AcquisitionResult", "AcquisitionService"]
+__all__ = ["AcquisitionResult", "AcquisitionService", "URLFetcher"]
 
