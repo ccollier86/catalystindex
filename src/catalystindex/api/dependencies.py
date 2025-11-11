@@ -6,8 +6,9 @@ from typing import Any
 
 from fastapi import Depends, Header, HTTPException, status
 
-from ..acquisition.service import AcquisitionService
-from ..artifacts.store import ArtifactStore, InMemoryArtifactStore, LocalArtifactStore
+from ..acquisition.firecrawl import FirecrawlFetcher, HttpURLFetcher
+from ..acquisition.service import AcquisitionService, URLFetcher
+from ..artifacts.store import ArtifactStore, InMemoryArtifactStore, LocalArtifactStore, S3ArtifactStore
 from ..auth.jwt import decode_jwt, ensure_scopes, extract_tenant
 from ..config.settings import get_settings
 from ..embeddings.hash import HashEmbeddingProvider
@@ -110,7 +111,31 @@ def get_artifact_store() -> ArtifactStore:
     backend = settings.storage.artifacts.backend.lower()
     if backend == "memory":
         return InMemoryArtifactStore()
+    if backend == "s3":
+        s3_settings = settings.storage.artifacts.s3
+        return S3ArtifactStore(
+            bucket=s3_settings.bucket,
+            prefix=s3_settings.prefix,
+            region_name=s3_settings.region,
+            endpoint_url=s3_settings.endpoint_url,
+        )
     return LocalArtifactStore(settings.storage.artifacts.base_path)
+
+
+@lru_cache
+def get_url_fetcher() -> URLFetcher:
+    settings = get_settings()
+    firecrawl_settings = settings.acquisition.firecrawl
+    if firecrawl_settings.enabled and firecrawl_settings.api_key:
+        return FirecrawlFetcher(
+            api_key=firecrawl_settings.api_key,
+            base_url=firecrawl_settings.base_url,
+            timeout=firecrawl_settings.timeout,
+            scrape_format=firecrawl_settings.format,
+        )
+    if settings.acquisition.use_http_fallback:
+        return HttpURLFetcher()
+    raise RuntimeError("URL fetching disabled by configuration")
 
 
 @lru_cache
@@ -176,7 +201,7 @@ def get_ingestion_task_dispatcher() -> IngestionTaskDispatcher | None:
 
 @lru_cache
 def get_acquisition_service() -> AcquisitionService:
-    return AcquisitionService()
+    return AcquisitionService(url_fetcher=get_url_fetcher())
 
 
 def get_ingestion_service() -> IngestionService:

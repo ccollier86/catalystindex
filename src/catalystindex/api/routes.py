@@ -60,6 +60,7 @@ class ChunkModel(BaseModel):
 class ArtifactModel(BaseModel):
     uri: str
     content_type: str | None = None
+    metadata: dict = Field(default_factory=dict)
 
 
 class DocumentResultModel(BaseModel):
@@ -429,7 +430,12 @@ def _document_to_model(result: object) -> DocumentResultModel:
     artifact_content_type = getattr(result, "artifact_content_type", None)
     artifact = None
     if artifact_uri:
-        artifact = ArtifactModel(uri=artifact_uri, content_type=artifact_content_type)
+        artifact_metadata = getattr(result, "artifact_metadata", {}) or {}
+        artifact = ArtifactModel(
+            uri=artifact_uri,
+            content_type=artifact_content_type,
+            metadata=dict(artifact_metadata),
+        )
     doc_chunks = getattr(result, "chunks", None)
     chunk_models = [ChunkModel.from_record(chunk) for chunk in doc_chunks] if doc_chunks else None
     return DocumentResultModel(

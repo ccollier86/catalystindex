@@ -29,9 +29,30 @@ class RedisSettings(BaseModel):
     ttl_seconds: int = 60 * 60 * 24 * 7
 
 
+class S3ArtifactSettings(BaseModel):
+    bucket: str = Field(default="", description="Bucket name for the artifact store")
+    prefix: str = Field(default="", description="Key prefix for stored artifacts")
+    region: str | None = Field(default=None, description="AWS region for the bucket")
+    endpoint_url: str | None = Field(default=None, description="Custom endpoint for S3-compatible storage")
+
+
 class ArtifactSettings(BaseModel):
-    backend: str = Field(default="local", description="Artifact backend (local or memory)")
+    backend: str = Field(default="local", description="Artifact backend (local, s3, or memory)")
     base_path: str = Field(default="artifacts", description="Filesystem path for local artifact storage")
+    s3: S3ArtifactSettings = Field(default_factory=S3ArtifactSettings)
+
+
+class FirecrawlSettings(BaseModel):
+    enabled: bool = Field(default=False, description="Enable Firecrawl-backed URL fetching")
+    api_key: str = Field(default="", description="Firecrawl API key")
+    base_url: str = Field(default="https://api.firecrawl.dev", description="Firecrawl API base URL")
+    timeout: int = Field(default=60, description="Request timeout (seconds) for Firecrawl")
+    format: str = Field(default="markdown", description="Preferred Firecrawl scrape format")
+
+
+class AcquisitionSettings(BaseModel):
+    use_http_fallback: bool = Field(default=True, description="Use HTTP fetcher when Firecrawl is disabled")
+    firecrawl: FirecrawlSettings = Field(default_factory=FirecrawlSettings)
 
 
 class StorageSettings(BaseModel):
@@ -76,6 +97,7 @@ class AppSettings(BaseModel):
     features: FeatureFlags = Field(default_factory=FeatureFlags)
     telemetry_namespace: str = "catalystindex"
     jobs: JobSettings = Field(default_factory=JobSettings)
+    acquisition: AcquisitionSettings = Field(default_factory=AcquisitionSettings)
 
 
 @lru_cache

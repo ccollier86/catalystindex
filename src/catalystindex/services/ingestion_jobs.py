@@ -51,6 +51,7 @@ class JobDocumentResult:
     chunk_count: int
     artifact_uri: str | None
     artifact_content_type: str | None
+    artifact_metadata: Dict[str, object]
     parser: str | None
     metadata: Dict[str, object]
     error: str | None = None
@@ -151,6 +152,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 chunk_count=0,
                 artifact_uri=None,
                 artifact_content_type=None,
+                artifact_metadata={},
                 parser=sub.parser_hint,
                 metadata=dict(sub.metadata),
                 error=None,
@@ -182,12 +184,13 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     chunk_count,
                     artifact_uri,
                     artifact_content_type,
+                    artifact_metadata,
                     parser,
                     metadata,
                     error,
                     chunks
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -198,6 +201,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                         doc.chunk_count,
                         doc.artifact_uri,
                         doc.artifact_content_type,
+                        _serialize_json(doc.artifact_metadata),
                         doc.parser,
                         _serialize_json(doc.metadata),
                         None,
@@ -254,6 +258,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     chunk_count = ?,
                     artifact_uri = ?,
                     artifact_content_type = ?,
+                    artifact_metadata = ?,
                     parser = ?,
                     metadata = ?,
                     error = NULL,
@@ -266,6 +271,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     document.chunk_count,
                     document.artifact_uri,
                     document.artifact_content_type,
+                    _serialize_json(document.artifact_metadata),
                     document.parser,
                     _serialize_json(document.metadata),
                     _serialize_chunks(document.chunks),
@@ -300,12 +306,13 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             self._execute(
                 """
                 UPDATE ingestion_job_documents
-                SET status = ?, error = ?, metadata = ?, parser = ?, chunks = ?
+                SET status = ?, error = ?, artifact_metadata = ?, metadata = ?, parser = ?, chunks = ?
                 WHERE job_id = ? AND document_id = ?
                 """,
                 (
                     DocumentStatus.FAILED.value,
                     error,
+                    _serialize_json(existing.artifact_metadata),
                     _serialize_json(metadata_payload),
                     parser_value,
                     _serialize_chunks(existing.chunks),
@@ -369,6 +376,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     chunk_count INTEGER,
                     artifact_uri TEXT,
                     artifact_content_type TEXT,
+                    artifact_metadata TEXT,
                     parser TEXT,
                     metadata TEXT,
                     error TEXT,
@@ -378,6 +386,14 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 """,
             )
             self._connection.commit()
+        try:
+            self._execute("ALTER TABLE ingestion_job_documents ADD COLUMN artifact_metadata TEXT", ())
+            self._connection.commit()
+        except Exception:  # pragma: no cover - best-effort schema upgrade
+            try:
+                self._connection.rollback()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
 
     def _refresh_job_status(self, job_id: str) -> IngestionJobRecord:
         job_row = self._execute(
@@ -442,7 +458,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         cursor = self._execute(
             """
             SELECT document_id, status, policy, chunk_count, artifact_uri,
-                   artifact_content_type, parser, metadata, error, chunks
+                   artifact_content_type, artifact_metadata, parser, metadata, error, chunks
             FROM ingestion_job_documents
             WHERE job_id = ?
             ORDER BY document_id
@@ -458,6 +474,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 chunk_count,
                 artifact_uri,
                 artifact_content_type,
+                artifact_metadata,
                 parser,
                 metadata,
                 error,
@@ -471,6 +488,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     chunk_count=chunk_count or 0,
                     artifact_uri=artifact_uri,
                     artifact_content_type=artifact_content_type,
+                    artifact_metadata=_deserialize_json(artifact_metadata),
                     parser=parser,
                     metadata=_deserialize_json(metadata),
                     error=error,
@@ -507,7 +525,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         cursor = self._execute(
             """
             SELECT status, policy, chunk_count, artifact_uri,
-                   artifact_content_type, parser, metadata, error, chunks
+                   artifact_content_type, artifact_metadata, parser, metadata, error, chunks
             FROM ingestion_job_documents
             WHERE job_id = ? AND document_id = ?
             """,
@@ -522,6 +540,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             chunk_count,
             artifact_uri,
             artifact_content_type,
+            artifact_metadata,
             parser,
             metadata,
             error,
@@ -534,6 +553,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             chunk_count=chunk_count or 0,
             artifact_uri=artifact_uri,
             artifact_content_type=artifact_content_type,
+            artifact_metadata=_deserialize_json(artifact_metadata),
             parser=parser,
             metadata=_deserialize_json(metadata),
             error=error,
@@ -568,6 +588,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             chunk_count=document.chunk_count,
             artifact_uri=document.artifact_uri,
             artifact_content_type=document.artifact_content_type,
+            artifact_metadata=dict(document.artifact_metadata),
             parser=document.parser,
             metadata=dict(document.metadata),
             error=document.error,
@@ -800,6 +821,7 @@ class IngestionCoordinator:
             chunk_count=len(ingestion_result.chunks),
             artifact_uri=artifact.uri,
             artifact_content_type=artifact.content_type,
+            artifact_metadata=dict(artifact.metadata),
             parser=parser_name,
             metadata=document_metadata,
             chunks=ingestion_result.chunks,
