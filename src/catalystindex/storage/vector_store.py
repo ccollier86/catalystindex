@@ -34,6 +34,17 @@ class VectorStoreClient:
     ) -> List[RetrievalResult]:
         raise NotImplementedError
 
+    def apply_feedback(
+        self,
+        tenant: Tenant,
+        chunk_ids: Iterable[str],
+        *,
+        positive: bool,
+    ) -> None:
+        """Adjust payload metadata based on user feedback."""
+
+        return None
+
 
 class InMemoryVectorStore(VectorStoreClient):
     """Tenant-aware in-memory vector store supporting cosine similarity."""
@@ -75,6 +86,28 @@ class InMemoryVectorStore(VectorStoreClient):
         results.sort(key=lambda item: item.score, reverse=True)
         return results[:limit]
 
+    def apply_feedback(
+        self,
+        tenant: Tenant,
+        chunk_ids: Iterable[str],
+        *,
+        positive: bool,
+    ) -> None:
+        docs = self._store.get(self._key(tenant), [])
+        if not docs:
+            return
+        adjustment = 1 if positive else -1
+        targets = set(chunk_ids)
+        if not targets:
+            return
+        for doc in docs:
+            if doc.chunk.chunk_id not in targets:
+                continue
+            metadata = doc.chunk.metadata
+            key = "feedback_positive" if positive else "feedback_negative"
+            metadata[key] = int(metadata.get(key, 0)) + 1
+            metadata["feedback_score"] = float(metadata.get("feedback_score", 0.0)) + adjustment
+
 
 class QdrantVectorStore(VectorStoreClient):
     """Vector store implementation backed by Qdrant collections."""
@@ -105,6 +138,7 @@ class QdrantVectorStore(VectorStoreClient):
         self._vector_size = vector_size
         self._sparse_enabled = sparse_enabled
         self._metadata_fields = metadata_fields or {}
+        self._known_tracks: set[str] = set()
 
     def upsert(self, tenant: Tenant, documents: Iterable[VectorDocument]) -> None:
         grouped: Dict[str, List[VectorDocument]] = defaultdict(list)
@@ -115,6 +149,7 @@ class QdrantVectorStore(VectorStoreClient):
             self._ensure_collection(collection)
             points = [self._build_point(tenant, doc) for doc in docs]
             self._client.upsert(collection_name=collection, points=points)
+            self._known_tracks.add(track)
 
     def query(
         self,
@@ -165,9 +200,64 @@ class QdrantVectorStore(VectorStoreClient):
         retrievals.sort(key=lambda item: item.score, reverse=True)
         return retrievals
 
+    def apply_feedback(
+        self,
+        tenant: Tenant,
+        chunk_ids: Iterable[str],
+        *,
+        positive: bool,
+    ) -> None:
+        identifiers = list(chunk_ids)
+        if not identifiers:
+            return
+        point_ids = [self._point_id(tenant, chunk_id) for chunk_id in identifiers]
+        adjustment = 1 if positive else -1
+        for track in list(self._known_tracks):
+            collection = self._collection_name(track)
+            if not self._collection_exists(collection):
+                continue
+            try:
+                points = self._client.retrieve(
+                    collection_name=collection,
+                    ids=point_ids,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:  # pragma: no cover - passthrough to qdrant
+                continue
+            if not points:
+                continue
+            for point in points:
+                payload = point.payload or {}
+                positive_count = int(payload.get("feedback_positive", 0))
+                negative_count = int(payload.get("feedback_negative", 0))
+                score = float(payload.get("feedback_score", 0.0))
+                if positive:
+                    positive_count += 1
+                else:
+                    negative_count += 1
+                score += adjustment
+                identifier = getattr(point, "id", None)
+                if identifier is None and isinstance(payload, dict):
+                    identifier = payload.get("id")
+                if identifier is None:
+                    continue
+                self._client.set_payload(  # type: ignore[call-arg]
+                    collection_name=collection,
+                    payload={
+                        "feedback_positive": positive_count,
+                        "feedback_negative": negative_count,
+                        "feedback_score": score,
+                    },
+                    point_ids=[identifier],
+                )
+
     # Internal helpers -------------------------------------------------
     def _collection_name(self, track: str) -> str:
         return f"{self._collection_prefix}_{track}"
+
+    def _point_id(self, tenant: Tenant, chunk_id: str) -> str:
+        return f"{tenant.org_id}:{tenant.workspace_id}:{chunk_id}"
 
     def _ensure_collection(self, collection: str) -> None:
         if self._collection_exists(collection):
