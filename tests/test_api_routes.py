@@ -1,7 +1,7 @@
 import base64
-import json
-import hmac
 import hashlib
+import hmac
+import json
 
 from fastapi.testclient import TestClient
 
@@ -34,7 +34,7 @@ def test_ingest_and_search_flow():
     app = create_app()
     client = TestClient(app)
 
-    token = build_token(["ingest:write", "search:read", "generate:write"])
+    token = build_token(["ingest:write", "search:read", "generate:write", "feedback:write"])
     headers = {"Authorization": f"Bearer {token}"}
 
     ingest_response = client.post(
@@ -48,16 +48,23 @@ def test_ingest_and_search_flow():
     )
     assert ingest_response.status_code == 200
     data = ingest_response.json()
-    assert data["chunk_count"] > 0
+    assert data["status"] == "completed"
+    assert data["document"]["chunk_count"] > 0
+    assert data["document"]["chunks"]
 
     search_response = client.post(
         "/search/query",
-        json={"query": "trauma exposure"},
+        json={"query": "trauma exposure", "debug": True},
         headers=headers,
     )
     assert search_response.status_code == 200
-    results = search_response.json()["results"]
-    assert results
+    search_payload = search_response.json()
+    assert search_payload["results"]
+    assert search_payload["mode"] in {"economy", "premium"}
+    first_result = search_payload["results"][0]
+    assert "metadata" in first_result
+    if search_payload.get("debug"):
+        assert "expanded_query" in search_payload["debug"]
 
     generation_response = client.post(
         "/generate/summary",
@@ -67,3 +74,19 @@ def test_ingest_and_search_flow():
     assert generation_response.status_code == 200
     summary = generation_response.json()
     assert summary["chunk_count"] <= 6
+
+    feedback_response = client.post(
+        "/feedback",
+        json={
+            "query": "trauma exposure",
+            "chunk_ids": [first_result["chunk_id"]],
+            "positive": True,
+            "comment": "Helpful context",
+        },
+        headers=headers,
+    )
+    assert feedback_response.status_code == 200
+    feedback_payload = feedback_response.json()
+    assert feedback_payload["status"] == "recorded"
+    assert feedback_payload["positive"] is True
+    assert first_result["chunk_id"] in feedback_payload["chunk_ids"]
