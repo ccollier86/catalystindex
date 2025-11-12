@@ -29,3 +29,6 @@ workers = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: tests that require external services (Qdrant, etc.)",
+]

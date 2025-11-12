@@ -189,6 +189,32 @@ class QdrantVectorStore(VectorStoreClient):
             if not chunk_payload:
                 continue
             chunk = ChunkRecord(**chunk_payload)
+            feedback_positive = payload.get("feedback_positive")
+            feedback_negative = payload.get("feedback_negative")
+            feedback_score = payload.get("feedback_score")
+            if any(value is not None for value in (feedback_positive, feedback_negative, feedback_score)):
+                meta = dict(chunk.metadata)
+                if feedback_positive is not None:
+                    meta["feedback_positive"] = feedback_positive
+                if feedback_negative is not None:
+                    meta["feedback_negative"] = feedback_negative
+                if feedback_score is not None:
+                    meta["feedback_score"] = feedback_score
+                chunk = ChunkRecord(
+                    chunk_id=chunk.chunk_id,
+                    section_slug=chunk.section_slug,
+                    text=chunk.text,
+                    chunk_tier=chunk.chunk_tier,
+                    start_page=chunk.start_page,
+                    end_page=chunk.end_page,
+                    bbox_pointer=chunk.bbox_pointer,
+                    summary=chunk.summary,
+                    key_terms=chunk.key_terms,
+                    requires_previous=chunk.requires_previous,
+                    prev_chunk_id=chunk.prev_chunk_id,
+                    confidence_note=chunk.confidence_note,
+                    metadata=meta,
+                )
             retrievals.append(
                 RetrievalResult(
                     chunk=chunk,

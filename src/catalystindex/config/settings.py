@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from functools import lru_cache
 from typing import List
 
@@ -70,6 +72,7 @@ class FeatureFlags(BaseModel):
     enable_generation: bool = True
     enable_metrics: bool = True
     enable_premium_rerank: bool = True
+    search_feedback_weight: float = 0.15
 
 
 class RerankerSettings(BaseModel):
@@ -117,8 +120,52 @@ class AppSettings(BaseModel):
 @lru_cache
 def get_settings() -> AppSettings:
     """Return cached application settings."""
+    base = AppSettings()
+    overrides = _load_env_overrides()
+    if not overrides:
+        return base
+    return base.model_copy(update=overrides)
 
-    return AppSettings()
+
+def _load_env_overrides(prefix: str = "CATALYST_") -> dict:
+    overrides: dict = {}
+    for key, raw_value in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        path = key[len(prefix) :].strip("_")
+        if not path:
+            continue
+        segments = [segment.lower() for segment in path.split("__") if segment]
+        if not segments:
+            continue
+        cursor = overrides
+        for segment in segments[:-1]:
+            cursor = cursor.setdefault(segment, {})
+        cursor[segments[-1]] = _coerce_env_value(raw_value)
+    return overrides
+
+
+def _coerce_env_value(value: str):
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    if value.isdigit():
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    if value.startswith("[") or value.startswith("{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 
 __all__ = ["AppSettings", "get_settings"]

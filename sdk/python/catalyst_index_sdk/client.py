@@ -106,6 +106,12 @@ class CatalystIndexClient:
         payload = self._get(f"/ingest/jobs/{job_id}")
         return self._parse_job(payload)
 
+    def get_ingestion_job_status(self, job_id: str) -> IngestionJobStatus:
+        payload = self._get(f"/ingest/jobs/{job_id}/status")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected job status payload")
+        return self._parse_ingestion_status(payload)
+
     def search(
         self,
         *,

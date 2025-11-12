@@ -15,18 +15,41 @@ This repository contains a reference implementation of the Catalyst Index retrie
 
 ## Running locally
 
-Install dependencies and start the FastAPI application:
+Install dependencies and start the FastAPI application using [uv](https://github.com/astral-sh/uv):
 
 ```bash
-pip install -e .[dev]
-uvicorn catalystindex.main:app --reload
+uv pip install -e .[dev]
+uv run uvicorn catalystindex.main:app --reload
 ```
+
+For end-to-end testing with the asynchronous ingestion queue, Redis/Postgres, and Qdrant, see [`docs/runtime_profiles.md`](docs/runtime_profiles.md). The repo ships with `infrastructure/docker-compose.dev.yml` to boot the supporting services and a helper worker runner under `scripts/run_worker.py`.
+
+Runtime settings can be overridden via environment variables using the pattern `CATALYST_<section>__<field>`. For example:
+
+```bash
+export CATALYST_JOBS__store__postgres_dsn=postgresql://catalyst:catalyst@localhost:5432/catalystjobs
+export CATALYST_STORAGE__vector_backend=qdrant
+```
+
+Operational dashboards and CLI tooling are described in [`docs/observability.md`](docs/observability.md). Use `scripts/catalystctl.py` for quick telemetry snapshots or `scripts/ingest_and_search_demo.py` for manual smoke tests.
 
 ## Testing
 
 ```bash
-pytest
+uv pip install -e .[dev]
+uv run pytest
 ```
+
+- Smoke tests (FastAPI test client):
+  ```bash
+  uv run pytest tests/smoke/test_ingest_search_flow.py
+  ```
+- Integration (requires Qdrant running via docker compose):
+  ```bash
+  TEST_QDRANT_HOST=localhost TEST_QDRANT_PORT=6333 uv run pytest tests/integration/test_qdrant_vector_store.py
+  ```
+
+See [`docs/testing.md`](docs/testing.md) for additional scenarios (perf scripts, markers, CI profile).
 
 ## SDK
 

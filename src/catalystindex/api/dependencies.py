@@ -282,6 +282,7 @@ def get_search_service() -> SearchService:
         premium_k=settings.storage.premium_max_k,
         enable_sparse_queries=settings.storage.qdrant.sparse_vectors,
         premium_rerank_enabled=settings.features.enable_premium_rerank,
+        feedback_weight=settings.features.search_feedback_weight,
     )
 
 

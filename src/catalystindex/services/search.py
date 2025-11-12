@@ -78,6 +78,7 @@ class SearchService:
         premium_k: int = 24,
         enable_sparse_queries: bool = False,
         premium_rerank_enabled: bool = True,
+        feedback_weight: float = 0.15,
     ) -> None:
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -90,6 +91,7 @@ class SearchService:
         self._premium_k = max(self._economy_k, premium_k)
         self._sparse_queries_enabled = enable_sparse_queries
         self._premium_rerank_enabled = premium_rerank_enabled
+        self._feedback_weight = max(0.0, feedback_weight)
 
     def retrieve(self, tenant: Tenant, *, query: str, options: SearchOptions | None = None) -> SearchExecution:
         options = options or SearchOptions()
@@ -130,7 +132,7 @@ class SearchService:
             and fused_results
         ):
             fused_results = list(self._reranker.rerank(expanded_query, fused_results, limit=limit))
-        final_results = fused_results[:limit]
+        final_results = self._apply_feedback_boost(fused_results[:limit])
 
         explanations = {
             result.chunk.chunk_id: self._build_explanation(result, index)
@@ -301,6 +303,23 @@ class SearchService:
             scored.append((fused_score, RetrievalResult(chunk=result.chunk, score=fused_score, track=result.track, vision_context=result.vision_context)))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in scored][:limit]
+
+    def _apply_feedback_boost(self, results: Sequence[RetrievalResult]) -> List[RetrievalResult]:
+        if not self._feedback_weight:
+            return list(results)
+        boosted: List[RetrievalResult] = []
+        for result in results:
+            feedback_score = float(result.chunk.metadata.get("feedback_score", 0.0) or 0.0)
+            adjusted = float(result.score) + self._feedback_weight * feedback_score
+            boosted.append(
+                RetrievalResult(
+                    chunk=result.chunk,
+                    score=adjusted,
+                    track=result.track,
+                    vision_context=result.vision_context,
+                )
+            )
+        return boosted
 
     def _build_explanation(self, result: RetrievalResult, index: int) -> str:
         chunk = result.chunk
