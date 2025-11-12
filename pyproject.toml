@@ -21,6 +21,9 @@ qdrant = [
 redis = [
     "redis>=5.0.0",
 ]
+openai = [
+    "openai>=1.13.3",
+]
 workers = [
     "rq>=1.15.1",
     "redis>=5.0.0",

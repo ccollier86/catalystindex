@@ -29,6 +29,19 @@ Runtime settings can be overridden via environment variables using the pattern `
 ```bash
 export CATALYST_JOBS__store__postgres_dsn=postgresql://catalyst:catalyst@localhost:5432/catalystjobs
 export CATALYST_STORAGE__vector_backend=qdrant
+export CATALYST_EMBEDDINGS__provider=openai
+export CATALYST_EMBEDDINGS__model=text-embedding-3-large
+
+### Enabling Firecrawl for URL ingestion
+
+To route URL ingestion through Firecrawl (for HTML normalization, JS rendering, etc.), set:
+
+```bash
+export CATALYST_ACQUISITION__firecrawl__enabled=true
+export CATALYST_ACQUISITION__firecrawl__api_key=<your firecrawl key>
+```
+
+Any ingestion request with `source_type="url"` or `source_type="site"` will then use Firecrawl. Artifacts retain metadata such as `firecrawl: true`, `payload_size`, and original `source_uri`, so downstream audit logs and highlights know exactly how the content was collected.
 ```
 
 Operational dashboards and CLI tooling are described in [`docs/observability.md`](docs/observability.md). Use `scripts/catalystctl.py` for quick telemetry snapshots or `scripts/ingest_and_search_demo.py` for manual smoke tests.

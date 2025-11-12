@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from functools import lru_cache
 from typing import Any
@@ -100,7 +101,21 @@ def get_term_index() -> TermIndex:
 @lru_cache
 def get_embedding_provider() -> HashEmbeddingProvider:
     settings = get_settings()
-    return HashEmbeddingProvider(dimension=settings.storage.vector_dimension)
+    embeddings_settings = settings.embeddings
+    provider = (embeddings_settings.provider or "hash").lower()
+    if provider == "openai":
+        try:
+            from ..embeddings.openai import OpenAIEmbeddingProvider
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dep
+            raise RuntimeError(
+                "OpenAI embedding provider requested but 'openai' package is not installed. Install the 'openai' extra.",
+            ) from exc
+        api_key = embeddings_settings.api_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OpenAI embedding provider requires an API key (set OPENAI_API_KEY or CATALYST_EMBEDDINGS__api_key).")
+        model = embeddings_settings.model or "text-embedding-3-large"
+        return OpenAIEmbeddingProvider(api_key=api_key, model=model, base_url=embeddings_settings.base_url)
+    return HashEmbeddingProvider(dimension=embeddings_settings.dimension or settings.storage.vector_dimension)
 
 
 @lru_cache

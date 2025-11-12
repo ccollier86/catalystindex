@@ -75,6 +75,14 @@ class FeatureFlags(BaseModel):
     search_feedback_weight: float = 0.15
 
 
+class EmbeddingsSettings(BaseModel):
+    provider: str = Field(default="hash", description="Embedding provider identifier (hash or openai)")
+    model: str | None = Field(default=None, description="Model identifier for the provider")
+    api_key: str | None = Field(default=None, description="API key for hosted embedding providers")
+    base_url: str | None = Field(default=None, description="Override base URL for OpenAI-compatible endpoints")
+    dimension: int = Field(default=128, description="Expected embedding dimension")
+
+
 class RerankerSettings(BaseModel):
     enabled: bool = Field(default=False, description="Enable external reranker for premium mode")
     provider: str = Field(default="embedding", description="Reranker provider (embedding, cohere, openai)")
@@ -109,6 +117,7 @@ class AppSettings(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     features: FeatureFlags = Field(default_factory=FeatureFlags)
+    embeddings: EmbeddingsSettings = Field(default_factory=EmbeddingsSettings)
     reranker: RerankerSettings = Field(default_factory=RerankerSettings)
     telemetry_namespace: str = "catalystindex"
     metrics_exporter_port: int | None = 9464
