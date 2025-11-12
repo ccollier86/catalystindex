@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ..services.feedback import FeedbackService
+from ..services.feedback import FeedbackAnalyticsSnapshot, FeedbackItemSnapshot, FeedbackService
 from ..services.generation import GenerationService
 from ..services.ingestion_jobs import DocumentStatus, DocumentSubmission, IngestionCoordinator
 from ..services.search import SearchOptions, SearchService, TrackOptions
@@ -17,6 +17,7 @@ from .dependencies import (
     get_feedback_service,
     get_generation_service,
     get_ingestion_coordinator,
+    get_metrics,
     get_search_service,
     require_scopes,
 )
@@ -195,6 +196,24 @@ class FeedbackRequest(BaseModel):
     metadata: dict | None = None
 
 
+class FeedbackItemAnalyticsModel(BaseModel):
+    identifier: str
+    positive: int
+    negative: int
+    score: int
+    last_feedback_at: datetime | None = None
+    last_comment: str | None = None
+
+
+class FeedbackAnalyticsModel(BaseModel):
+    total_positive: int
+    total_negative: int
+    feedback_ratio: float
+    generated_at: datetime
+    chunks: List[FeedbackItemAnalyticsModel] = Field(default_factory=list)
+    queries: List[FeedbackItemAnalyticsModel] = Field(default_factory=list)
+
+
 class FeedbackResponseModel(BaseModel):
     status: str
     positive: bool
@@ -202,6 +221,70 @@ class FeedbackResponseModel(BaseModel):
     recorded_at: datetime
     comment: str | None = None
     metadata: dict | None = None
+    analytics: FeedbackAnalyticsModel
+
+
+class LatencySummaryModel(BaseModel):
+    count: int
+    avg: float
+    p50: float
+    p95: float
+    max: float
+
+
+class IngestionMetricsModel(BaseModel):
+    chunks: int
+    latency_ms: LatencySummaryModel
+
+
+class SearchMetricsModel(BaseModel):
+    requests: int
+    economy_requests: int
+    premium_requests: int
+    latency_ms: LatencySummaryModel
+
+
+class GenerationMetricsModel(BaseModel):
+    requests: int
+    latency_ms: LatencySummaryModel
+
+
+class FeedbackMetricsModel(BaseModel):
+    positive: int
+    negative: int
+    ratio: float
+    latency_ms: LatencySummaryModel
+
+
+class DependencyMetricsModel(BaseModel):
+    failures: Dict[str, int]
+    retries: Dict[str, int]
+
+
+class TelemetryExporterModel(BaseModel):
+    enabled: bool
+    running: bool
+    address: str | None = None
+    port: int | None = None
+
+
+class TelemetryMetricsModel(BaseModel):
+    ingestion: IngestionMetricsModel
+    search: SearchMetricsModel
+    generation: GenerationMetricsModel
+    feedback: FeedbackMetricsModel
+    dependencies: DependencyMetricsModel
+    exporter: TelemetryExporterModel
+
+
+class JobStatusModel(BaseModel):
+    job_id: str
+    status: str
+    documents_total: int
+    documents_completed: int
+    documents_failed: int
+    updated_at: datetime
+    error: str | None = None
 
 
 @router.get("/health")
@@ -309,6 +392,31 @@ def get_ingestion_job(
     )
 
 
+@router.get("/ingest/jobs/{job_id}/status", response_model=JobStatusModel)
+def get_ingestion_job_status(
+    job_id: str,
+    scopes = Depends(require_scopes("ingest:read")),
+    coordinator: IngestionCoordinator = Depends(get_ingestion_coordinator),
+):
+    _claims, tenant = scopes
+    job = coordinator.get_job(tenant, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+    completed = sum(1 for doc in job.documents if doc.status == DocumentStatus.SUCCEEDED)
+    failed = sum(1 for doc in job.documents if doc.status == DocumentStatus.FAILED)
+    total = len(job.documents)
+    status_value = job.status.value if hasattr(job.status, "value") else str(job.status)
+    return JobStatusModel(
+        job_id=job.job_id,
+        status=status_value,
+        documents_total=total,
+        documents_completed=completed,
+        documents_failed=failed,
+        updated_at=job.updated_at,
+        error=job.error,
+    )
+
+
 @router.post("/search/query", response_model=SearchResponse)
 def search_query(
     request: SearchRequest,
@@ -404,6 +512,7 @@ def submit_feedback(
         comment=request.comment,
         metadata=request.metadata,
     )
+    analytics_snapshot = service.analytics(tenant)
     return FeedbackResponseModel(
         status="recorded",
         positive=record.positive,
@@ -411,7 +520,28 @@ def submit_feedback(
         recorded_at=record.recorded_at,
         comment=record.comment,
         metadata=record.metadata or None,
+        analytics=_analytics_to_model(analytics_snapshot),
     )
+
+
+@router.get("/feedback/analytics", response_model=FeedbackAnalyticsModel)
+def get_feedback_analytics(
+    scopes = Depends(require_scopes("feedback:read")),
+    service: FeedbackService = Depends(get_feedback_service),
+):
+    _claims, tenant = scopes
+    snapshot = service.analytics(tenant)
+    return _analytics_to_model(snapshot)
+
+
+@router.get("/telemetry/metrics", response_model=TelemetryMetricsModel)
+def telemetry_metrics(
+    scopes = Depends(require_scopes("telemetry:read")),
+    metrics = Depends(get_metrics),
+):
+    _claims, _tenant = scopes
+    snapshot = metrics.snapshot()
+    return _telemetry_to_model(snapshot)
 
 
 __all__ = ["router"]
@@ -471,4 +601,77 @@ def _retrieval_to_model(result: RetrievalResult, explanation: str | None) -> Ret
         metadata=metadata,
         vision_context=result.vision_context,
         explanation=explanation,
+    )
+
+
+def _analytics_to_model(snapshot: FeedbackAnalyticsSnapshot) -> FeedbackAnalyticsModel:
+    return FeedbackAnalyticsModel(
+        total_positive=snapshot.total_positive,
+        total_negative=snapshot.total_negative,
+        feedback_ratio=snapshot.feedback_ratio,
+        generated_at=snapshot.generated_at,
+        chunks=[_analytics_item_to_model(item) for item in snapshot.chunks],
+        queries=[_analytics_item_to_model(item) for item in snapshot.queries],
+    )
+
+
+def _analytics_item_to_model(item: FeedbackItemSnapshot) -> FeedbackItemAnalyticsModel:
+    return FeedbackItemAnalyticsModel(
+        identifier=item.identifier,
+        positive=item.positive,
+        negative=item.negative,
+        score=item.score,
+        last_feedback_at=item.last_feedback_at,
+        last_comment=item.last_comment,
+    )
+
+
+def _latency_summary_to_model(summary: Dict[str, object]) -> LatencySummaryModel:
+    return LatencySummaryModel(
+        count=int(summary.get("count", 0) or 0),
+        avg=float(summary.get("avg", 0.0) or 0.0),
+        p50=float(summary.get("p50", 0.0) or 0.0),
+        p95=float(summary.get("p95", 0.0) or 0.0),
+        max=float(summary.get("max", 0.0) or 0.0),
+    )
+
+
+def _telemetry_to_model(snapshot: Dict[str, object]) -> TelemetryMetricsModel:
+    ingestion = snapshot.get("ingestion", {}) or {}
+    search = snapshot.get("search", {}) or {}
+    generation = snapshot.get("generation", {}) or {}
+    feedback = snapshot.get("feedback", {}) or {}
+    dependencies = snapshot.get("dependencies", {}) or {}
+    exporter = snapshot.get("exporter", {}) or {}
+    return TelemetryMetricsModel(
+        ingestion=IngestionMetricsModel(
+            chunks=int(ingestion.get("chunks", 0) or 0),
+            latency_ms=_latency_summary_to_model(ingestion.get("latency_ms", {}) or {}),
+        ),
+        search=SearchMetricsModel(
+            requests=int(search.get("requests", 0) or 0),
+            economy_requests=int(search.get("economy_requests", 0) or 0),
+            premium_requests=int(search.get("premium_requests", 0) or 0),
+            latency_ms=_latency_summary_to_model(search.get("latency_ms", {}) or {}),
+        ),
+        generation=GenerationMetricsModel(
+            requests=int(generation.get("requests", 0) or 0),
+            latency_ms=_latency_summary_to_model(generation.get("latency_ms", {}) or {}),
+        ),
+        feedback=FeedbackMetricsModel(
+            positive=int(feedback.get("positive", 0) or 0),
+            negative=int(feedback.get("negative", 0) or 0),
+            ratio=float(feedback.get("ratio", 0.0) or 0.0),
+            latency_ms=_latency_summary_to_model(feedback.get("latency_ms", {}) or {}),
+        ),
+        dependencies=DependencyMetricsModel(
+            failures={k: int(v) for k, v in (dependencies.get("failures", {}) or {}).items()},
+            retries={k: int(v) for k, v in (dependencies.get("retries", {}) or {}).items()},
+        ),
+        exporter=TelemetryExporterModel(
+            enabled=bool(exporter.get("enabled", False)),
+            running=bool(exporter.get("running", False)),
+            address=exporter.get("address"),
+            port=exporter.get("port"),
+        ),
     )
