@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
@@ -58,7 +58,7 @@ class InMemoryArtifactStore:
             uri=key,
             content_type=content_type,
             metadata=meta,
-            stored_at=datetime.utcnow(),
+            stored_at=datetime.now(timezone.utc),
         )
         self._store[key] = record
         return record
@@ -89,7 +89,7 @@ class LocalArtifactStore:
         extension = self._extension_from_type(content_type)
         file_path = tenant_path / f"{document_id}{extension}"
         file_path.write_bytes(content)
-        stored_at = datetime.utcnow()
+        stored_at = datetime.now(timezone.utc)
         meta = dict(metadata or {})
         meta.setdefault("payload_size", len(content))
         meta_path = file_path.with_suffix(f"{file_path.suffix}.metadata.json")
@@ -164,7 +164,7 @@ class S3ArtifactStore:
         )
         meta = dict(metadata or {})
         meta.setdefault("payload_size", len(content))
-        stored_at = datetime.utcnow()
+        stored_at = datetime.now(timezone.utc)
         s3_metadata = {
             "artifact-metadata": json.dumps(meta, default=str),
             "stored-at": stored_at.isoformat(),
@@ -198,4 +198,3 @@ __all__ = [
     "LocalArtifactStore",
     "S3ArtifactStore",
 ]
-

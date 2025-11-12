@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock
 from typing import Any, Dict, List, Optional, Protocol, Sequence
@@ -141,7 +141,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
     def create(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
         job_id = uuid4().hex
         tenant_key = _tenant_key(tenant)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         documents: List[PersistedJobDocument] = [
             PersistedJobDocument(
@@ -224,7 +224,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         return record
 
     def mark_document_running(self, job_id: str, document_id: str) -> IngestionJobRecord:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._execute(
                 """
@@ -247,7 +247,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         return record
 
     def complete_document(self, job_id: str, document: JobDocumentResult) -> IngestionJobRecord:
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._execute(
                 """
@@ -298,7 +298,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         metadata: Optional[Dict[str, object]] = None,
         parser: str | None = None,
     ) -> IngestionJobRecord:
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
         existing = self._load_document(job_id, document_id)
         metadata_payload = metadata if metadata is not None else existing.metadata
         parser_value = parser or existing.parser
@@ -424,7 +424,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 job_status = IngestionJobStatus.FAILED
             else:
                 job_status = IngestionJobStatus.PARTIAL
-        updated_at = datetime.utcnow()
+        updated_at = datetime.now(timezone.utc)
         errors = [doc.error for doc in documents if doc.error]
         error_value = "; ".join(errors) if errors else None
         with self._lock:

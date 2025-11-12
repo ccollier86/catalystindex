@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Dict, Iterable, List
 
@@ -325,7 +325,7 @@ class AuditLogger:
             "document_id": document_id,
             "chunk_count": chunk_count,
             "policy": policy,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if job_id:
             extra["job_id"] = job_id
@@ -345,7 +345,7 @@ class AuditLogger:
                 "tenant": asdict(tenant),
                 "query_hash": hash(query),
                 "result_count": result_count,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
@@ -356,7 +356,7 @@ class AuditLogger:
                 "tenant": asdict(tenant),
                 "query_hash": hash(query),
                 "chunk_ids": chunk_ids,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
@@ -375,7 +375,7 @@ class AuditLogger:
             "query_hash": hash(query),
             "chunk_ids": chunk_ids,
             "positive": positive,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if comment:
             payload["comment"] = comment

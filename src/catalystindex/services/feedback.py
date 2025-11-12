@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Dict, Iterable, Tuple
 
@@ -190,7 +190,7 @@ class FeedbackService:
             except Exception:  # pragma: no cover - defensive guard for optional backends
                 LOGGER.exception("feedback.vector_store_update_failed")
 
-        recorded_at = datetime.utcnow()
+        recorded_at = datetime.now(timezone.utc)
         self._metrics.record_feedback(
             positive=positive,
             count=len(normalized_chunk_ids),
@@ -222,7 +222,7 @@ class FeedbackService:
         )
 
     def analytics(self, tenant: Tenant) -> FeedbackAnalyticsSnapshot:
-        generated_at = datetime.utcnow()
+        generated_at = datetime.now(timezone.utc)
         state = self._analytics.get(_tenant_key(tenant))
         if not state:
             return FeedbackAnalyticsSnapshot(

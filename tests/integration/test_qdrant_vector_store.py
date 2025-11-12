@@ -17,6 +17,7 @@ class _TrackConfig:
     name: str = "text"
 
 
+@pytest.fixture(scope="module")
 def qdrant_connection():
     qdrant = pytest.importorskip("qdrant_client")
     host = os.getenv("TEST_QDRANT_HOST", "localhost")
@@ -74,4 +75,3 @@ def test_qdrant_vector_store_round_trip(qdrant_store):
     )
     assert results, "Expected at least one retrieval"
     assert results[0].chunk.chunk_id == "chunk-1"
-*** End Patch
