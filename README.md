@@ -55,6 +55,18 @@ Any ingestion request with `source_type="url"` or `source_type="site"` will then
 
 Operational dashboards and CLI tooling are described in [`docs/observability.md`](docs/observability.md). Use `scripts/catalystctl.py` for quick telemetry snapshots or `scripts/ingest_and_search_demo.py` for manual smoke tests.
 
+### Telemetry & CLI
+
+```bash
+# Show live metrics snapshot (requires valid JWT token with telemetry:read)
+uv run python scripts/catalystctl.py --base-url http://localhost:8000 --token <JWT> telemetry
+
+# Inspect an ingestion job status
+uv run python scripts/catalystctl.py --base-url http://localhost:8000 --token <JWT> ingest-status <job_id>
+```
+
+Grafana/Prometheus setup instructions (including a starter dashboard JSON) live in [`docs/observability.md`](docs/observability.md). Point Grafana at the metrics exporter (`CATALYST_METRICS_EXPORTER_PORT`, default 9464) to visualize ingestion/search/feedback counters.
+
 ## Testing
 
 ```bash
