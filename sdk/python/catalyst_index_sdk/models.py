@@ -108,6 +108,99 @@ class FeedbackReceipt:
     recorded_at: str
     comment: Optional[str] = None
     metadata: Dict[str, object] = field(default_factory=dict)
+    analytics: Optional["FeedbackAnalytics"] = None
+
+
+@dataclass(slots=True)
+class FeedbackItemAnalytics:
+    identifier: str
+    positive: int
+    negative: int
+    score: int
+    last_feedback_at: Optional[str]
+    last_comment: Optional[str] = None
+
+
+@dataclass(slots=True)
+class FeedbackAnalytics:
+    total_positive: int
+    total_negative: int
+    feedback_ratio: float
+    generated_at: str
+    chunks: List[FeedbackItemAnalytics]
+    queries: List[FeedbackItemAnalytics]
+
+
+@dataclass(slots=True)
+class LatencySummary:
+    count: int
+    avg: float
+    p50: float
+    p95: float
+    max: float
+
+
+@dataclass(slots=True)
+class IngestionMetrics:
+    chunks: int
+    latency_ms: LatencySummary
+
+
+@dataclass(slots=True)
+class SearchMetrics:
+    requests: int
+    economy_requests: int
+    premium_requests: int
+    latency_ms: LatencySummary
+
+
+@dataclass(slots=True)
+class GenerationMetrics:
+    requests: int
+    latency_ms: LatencySummary
+
+
+@dataclass(slots=True)
+class FeedbackMetrics:
+    positive: int
+    negative: int
+    ratio: float
+    latency_ms: LatencySummary
+
+
+@dataclass(slots=True)
+class DependencyMetrics:
+    failures: Dict[str, int]
+    retries: Dict[str, int]
+
+
+@dataclass(slots=True)
+class TelemetryExporter:
+    enabled: bool
+    running: bool
+    address: Optional[str]
+    port: Optional[int]
+
+
+@dataclass(slots=True)
+class TelemetryMetrics:
+    ingestion: IngestionMetrics
+    search: SearchMetrics
+    generation: GenerationMetrics
+    feedback: FeedbackMetrics
+    dependencies: DependencyMetrics
+    exporter: TelemetryExporter
+
+
+@dataclass(slots=True)
+class IngestionJobStatus:
+    job_id: str
+    status: str
+    documents_total: int
+    documents_completed: int
+    documents_failed: int
+    updated_at: str
+    error: Optional[str]
 
 
 __all__ = [
@@ -121,4 +214,15 @@ __all__ = [
     "SearchResultsEnvelope",
     "GenerationResult",
     "FeedbackReceipt",
+    "FeedbackAnalytics",
+    "FeedbackItemAnalytics",
+    "LatencySummary",
+    "IngestionMetrics",
+    "SearchMetrics",
+    "GenerationMetrics",
+    "FeedbackMetrics",
+    "DependencyMetrics",
+    "TelemetryExporter",
+    "TelemetryMetrics",
+    "IngestionJobStatus",
 ]

@@ -3,14 +3,25 @@
 from .client import CatalystIndexClient
 from .models import (
     ArtifactRef,
+    DependencyMetrics,
     FeedbackReceipt,
+    FeedbackAnalytics,
+    FeedbackItemAnalytics,
     GenerationResult,
     IngestionDocument,
     IngestionJob,
+    IngestionJobStatus,
     IngestionJobSummary,
+    IngestionMetrics,
+    LatencySummary,
     SearchDebug,
     SearchResult,
     SearchResultsEnvelope,
+    SearchMetrics,
+    GenerationMetrics,
+    FeedbackMetrics,
+    TelemetryMetrics,
+    TelemetryExporter,
 )
 
 __all__ = [
@@ -24,4 +35,15 @@ __all__ = [
     "SearchResultsEnvelope",
     "GenerationResult",
     "FeedbackReceipt",
+    "FeedbackAnalytics",
+    "FeedbackItemAnalytics",
+    "LatencySummary",
+    "IngestionMetrics",
+    "SearchMetrics",
+    "GenerationMetrics",
+    "FeedbackMetrics",
+    "DependencyMetrics",
+    "TelemetryExporter",
+    "TelemetryMetrics",
+    "IngestionJobStatus",
 ]

@@ -108,6 +108,8 @@ class AppSettings(BaseModel):
     features: FeatureFlags = Field(default_factory=FeatureFlags)
     reranker: RerankerSettings = Field(default_factory=RerankerSettings)
     telemetry_namespace: str = "catalystindex"
+    metrics_exporter_port: int | None = 9464
+    metrics_exporter_address: str = "0.0.0.0"
     jobs: JobSettings = Field(default_factory=JobSettings)
     acquisition: AcquisitionSettings = Field(default_factory=AcquisitionSettings)
 

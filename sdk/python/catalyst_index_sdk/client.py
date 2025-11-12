@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Dict, List, Optional
 
 from urllib import request as urllib_request
@@ -9,14 +10,25 @@ from urllib.error import HTTPError
 from .models import (
     ArtifactRef,
     Chunk,
+    DependencyMetrics,
+    FeedbackAnalytics,
+    FeedbackItemAnalytics,
     FeedbackReceipt,
     GenerationResult,
     IngestionDocument,
     IngestionJob,
+    IngestionJobStatus,
     IngestionJobSummary,
+    IngestionMetrics,
+    LatencySummary,
     SearchDebug,
     SearchResult,
     SearchResultsEnvelope,
+    SearchMetrics,
+    GenerationMetrics,
+    FeedbackMetrics,
+    TelemetryMetrics,
+    TelemetryExporter,
 )
 
 
@@ -161,6 +173,12 @@ class CatalystIndexClient:
         if metadata is not None:
             body["metadata"] = metadata
         payload = self._post("/feedback", body)
+        analytics_payload = payload.get("analytics")
+        analytics = (
+            self._parse_feedback_analytics(analytics_payload)
+            if isinstance(analytics_payload, dict)
+            else None
+        )
         return FeedbackReceipt(
             status=payload.get("status", "recorded"),
             positive=payload.get("positive", positive),
@@ -168,7 +186,41 @@ class CatalystIndexClient:
             recorded_at=payload.get("recorded_at", ""),
             comment=payload.get("comment"),
             metadata=payload.get("metadata", {}),
+            analytics=analytics,
         )
+
+    def get_feedback_analytics(self) -> FeedbackAnalytics:
+        payload = self._get("/feedback/analytics")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected analytics payload")
+        return self._parse_feedback_analytics(payload)
+
+    def get_ingestion_status(self, job_id: str) -> IngestionJobStatus:
+        payload = self._get(f"/ingest/jobs/{job_id}/status")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected ingestion status payload")
+        return self._parse_ingestion_status(payload)
+
+    def poll_ingestion_job(
+        self,
+        job_id: str,
+        *,
+        interval: float = 2.0,
+        timeout: float = 60.0,
+    ) -> IngestionJobStatus:
+        deadline = time.time() + timeout
+        status = self.get_ingestion_status(job_id)
+        terminal = {"succeeded", "failed", "partial"}
+        while status.status.lower() not in terminal and time.time() < deadline:
+            time.sleep(interval)
+            status = self.get_ingestion_status(job_id)
+        return status
+
+    def get_telemetry_metrics(self) -> TelemetryMetrics:
+        payload = self._get("/telemetry/metrics")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected telemetry payload")
+        return self._parse_telemetry_metrics(payload)
 
     def _parse_job(self, payload: Dict[str, object]) -> IngestionJob:
         documents_payload = payload.get("documents")
@@ -235,6 +287,108 @@ class CatalystIndexClient:
             metadata=payload.get("metadata", {}),
             vision_context=payload.get("vision_context"),
             explanation=payload.get("explanation"),
+        )
+
+    def _parse_feedback_analytics(self, payload: Dict[str, object]) -> FeedbackAnalytics:
+        return FeedbackAnalytics(
+            total_positive=int(payload.get("total_positive", 0) or 0),
+            total_negative=int(payload.get("total_negative", 0) or 0),
+            feedback_ratio=float(payload.get("feedback_ratio", 0.0) or 0.0),
+            generated_at=payload.get("generated_at", ""),
+            chunks=[
+                self._parse_feedback_item(item)
+                for item in payload.get("chunks", [])
+                if isinstance(item, dict)
+            ],
+            queries=[
+                self._parse_feedback_item(item)
+                for item in payload.get("queries", [])
+                if isinstance(item, dict)
+            ],
+        )
+
+    def _parse_feedback_item(self, payload: Dict[str, object]) -> FeedbackItemAnalytics:
+        return FeedbackItemAnalytics(
+            identifier=str(payload.get("identifier", "")),
+            positive=int(payload.get("positive", 0) or 0),
+            negative=int(payload.get("negative", 0) or 0),
+            score=int(payload.get("score", 0) or 0),
+            last_feedback_at=payload.get("last_feedback_at"),
+            last_comment=payload.get("last_comment"),
+        )
+
+    def _parse_latency_summary(self, payload: Dict[str, object]) -> LatencySummary:
+        return LatencySummary(
+            count=int(payload.get("count", 0) or 0),
+            avg=float(payload.get("avg", 0.0) or 0.0),
+            p50=float(payload.get("p50", 0.0) or 0.0),
+            p95=float(payload.get("p95", 0.0) or 0.0),
+            max=float(payload.get("max", 0.0) or 0.0),
+        )
+
+    def _parse_telemetry_metrics(self, payload: Dict[str, object]) -> TelemetryMetrics:
+        ingestion_payload = payload.get("ingestion", {}) or {}
+        search_payload = payload.get("search", {}) or {}
+        generation_payload = payload.get("generation", {}) or {}
+        feedback_payload = payload.get("feedback", {}) or {}
+        dependency_payload = payload.get("dependencies", {}) or {}
+        exporter_payload = payload.get("exporter", {}) or {}
+        return TelemetryMetrics(
+            ingestion=IngestionMetrics(
+                chunks=int(ingestion_payload.get("chunks", 0) or 0),
+                latency_ms=self._parse_latency_summary(
+                    ingestion_payload.get("latency_ms", {}) or {}
+                ),
+            ),
+            search=SearchMetrics(
+                requests=int(search_payload.get("requests", 0) or 0),
+                economy_requests=int(search_payload.get("economy_requests", 0) or 0),
+                premium_requests=int(search_payload.get("premium_requests", 0) or 0),
+                latency_ms=self._parse_latency_summary(
+                    search_payload.get("latency_ms", {}) or {}
+                ),
+            ),
+            generation=GenerationMetrics(
+                requests=int(generation_payload.get("requests", 0) or 0),
+                latency_ms=self._parse_latency_summary(
+                    generation_payload.get("latency_ms", {}) or {}
+                ),
+            ),
+            feedback=FeedbackMetrics(
+                positive=int(feedback_payload.get("positive", 0) or 0),
+                negative=int(feedback_payload.get("negative", 0) or 0),
+                ratio=float(feedback_payload.get("ratio", 0.0) or 0.0),
+                latency_ms=self._parse_latency_summary(
+                    feedback_payload.get("latency_ms", {}) or {}
+                ),
+            ),
+            dependencies=DependencyMetrics(
+                failures={
+                    str(key): int(value)
+                    for key, value in (dependency_payload.get("failures", {}) or {}).items()
+                },
+                retries={
+                    str(key): int(value)
+                    for key, value in (dependency_payload.get("retries", {}) or {}).items()
+                },
+            ),
+            exporter=TelemetryExporter(
+                enabled=bool(exporter_payload.get("enabled", False)),
+                running=bool(exporter_payload.get("running", False)),
+                address=exporter_payload.get("address"),
+                port=exporter_payload.get("port"),
+            ),
+        )
+
+    def _parse_ingestion_status(self, payload: Dict[str, object]) -> IngestionJobStatus:
+        return IngestionJobStatus(
+            job_id=payload.get("job_id", ""),
+            status=payload.get("status", ""),
+            documents_total=int(payload.get("documents_total", 0) or 0),
+            documents_completed=int(payload.get("documents_completed", 0) or 0),
+            documents_failed=int(payload.get("documents_failed", 0) or 0),
+            updated_at=payload.get("updated_at", ""),
+            error=payload.get("error"),
         )
 
     def _post(self, path: str, payload: Dict[str, object]) -> Dict[str, object]:
