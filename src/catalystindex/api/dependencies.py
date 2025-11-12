@@ -134,7 +134,9 @@ def get_artifact_store() -> ArtifactStore:
 def get_url_fetcher() -> URLFetcher:
     settings = get_settings()
     firecrawl_settings = settings.acquisition.firecrawl
-    if firecrawl_settings.enabled and firecrawl_settings.api_key:
+    if firecrawl_settings.enabled:
+        if not firecrawl_settings.api_key:
+            raise RuntimeError("Firecrawl acquisition enabled but no API key configured.")
         return FirecrawlFetcher(
             api_key=firecrawl_settings.api_key,
             base_url=firecrawl_settings.base_url,

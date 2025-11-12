@@ -838,7 +838,12 @@ class IngestionCoordinator:
             return
         if any(doc.status in {DocumentStatus.QUEUED, DocumentStatus.RUNNING} for doc in job.documents):
             return
-        self._metrics.record_ingestion_job(len(job.documents), status=job.status.value)
+        failed_documents = sum(1 for doc in job.documents if doc.status == DocumentStatus.FAILED)
+        self._metrics.record_ingestion_job(
+            len(job.documents),
+            status=job.status.value,
+            failed_documents=failed_documents,
+        )
 
 
 __all__ = [
@@ -852,4 +857,3 @@ __all__ = [
     "JobDocumentResult",
     "RedisPostgresIngestionJobStore",
 ]
-

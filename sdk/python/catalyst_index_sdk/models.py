@@ -175,6 +175,13 @@ class DependencyMetrics:
 
 
 @dataclass(slots=True)
+class JobMetrics:
+    total: int
+    by_status: Dict[str, int]
+    failed_documents: int
+
+
+@dataclass(slots=True)
 class TelemetryExporter:
     enabled: bool
     running: bool
@@ -185,6 +192,7 @@ class TelemetryExporter:
 @dataclass(slots=True)
 class TelemetryMetrics:
     ingestion: IngestionMetrics
+    jobs: JobMetrics
     search: SearchMetrics
     generation: GenerationMetrics
     feedback: FeedbackMetrics
@@ -222,6 +230,7 @@ __all__ = [
     "GenerationMetrics",
     "FeedbackMetrics",
     "DependencyMetrics",
+    "JobMetrics",
     "TelemetryExporter",
     "TelemetryMetrics",
     "IngestionJobStatus",

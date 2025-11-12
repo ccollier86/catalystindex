@@ -24,6 +24,8 @@ LOGGER = logging.getLogger("catalystindex")
 class _PrometheusHandles:
     ingestion_counter: object
     ingestion_latency: object
+    ingestion_job_counter: object
+    ingestion_job_failed_docs: object
     search_counter: object
     search_latency: object
     generation_counter: object
@@ -50,6 +52,9 @@ class MetricsRecorder:
     premium_requests: int = 0
     feedback_positive: int = 0
     feedback_negative: int = 0
+    ingestion_job_total: int = 0
+    ingestion_job_failed_documents: int = 0
+    ingestion_job_status: Dict[str, int] = field(default_factory=dict)
     ingestion_latency_ms: List[float] = field(default_factory=list)
     search_latency_ms: List[float] = field(default_factory=list)
     generation_latency_ms: List[float] = field(default_factory=list)
@@ -78,6 +83,15 @@ class MetricsRecorder:
                 f"{metric_prefix}_ingestion_latency_seconds",
                 "Ingestion latency distribution.",
                 buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+            ),
+            ingestion_job_counter=PrometheusCounter(
+                f"{metric_prefix}_ingestion_jobs_total",
+                "Total ingestion jobs completed (any status).",
+                labelnames=("status",),
+            ),
+            ingestion_job_failed_docs=PrometheusCounter(
+                f"{metric_prefix}_ingestion_job_failed_documents_total",
+                "Total documents that failed during ingestion jobs.",
             ),
             search_counter=PrometheusCounter(
                 f"{metric_prefix}_search_requests_total",
@@ -142,11 +156,20 @@ class MetricsRecorder:
             if self._prometheus:
                 self._prometheus.ingestion_latency.observe(latency_ms / 1000.0)
 
-    def record_ingestion_job(self, document_count: int, *, status: str) -> None:
+    def record_ingestion_job(self, document_count: int, *, status: str, failed_documents: int = 0) -> None:
+        status_lower = status.lower()
         LOGGER.info(
             "ingestion.job",
-            extra={"document_count": document_count, "status": status},
+            extra={"document_count": document_count, "status": status_lower},
         )
+        self.ingestion_job_total += 1
+        self.ingestion_job_status[status_lower] = self.ingestion_job_status.get(status_lower, 0) + 1
+        if failed_documents:
+            self.ingestion_job_failed_documents += failed_documents
+            if self._prometheus:
+                self._prometheus.ingestion_job_failed_docs.inc(failed_documents)
+        if self._prometheus:
+            self._prometheus.ingestion_job_counter.labels(status=status_lower).inc()
 
     def record_search(self, results_count: int, *, economy: bool, latency_ms: float | None = None) -> None:
         LOGGER.info(
@@ -221,6 +244,11 @@ class MetricsRecorder:
             "ingestion": {
                 "chunks": self.ingestion_count,
                 "latency_ms": self._latency_summary(self.ingestion_latency_ms),
+            },
+            "jobs": {
+                "total": self.ingestion_job_total,
+                "by_status": dict(self.ingestion_job_status),
+                "failed_documents": self.ingestion_job_failed_documents,
             },
             "search": {
                 "requests": self.search_count,

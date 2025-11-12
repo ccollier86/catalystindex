@@ -14,18 +14,19 @@ from .models import (
     FeedbackAnalytics,
     FeedbackItemAnalytics,
     FeedbackReceipt,
+    GenerationMetrics,
     GenerationResult,
     IngestionDocument,
     IngestionJob,
     IngestionJobStatus,
     IngestionJobSummary,
     IngestionMetrics,
+    JobMetrics,
     LatencySummary,
     SearchDebug,
     SearchResult,
     SearchResultsEnvelope,
     SearchMetrics,
-    GenerationMetrics,
     FeedbackMetrics,
     TelemetryMetrics,
     TelemetryExporter,
@@ -328,6 +329,7 @@ class CatalystIndexClient:
 
     def _parse_telemetry_metrics(self, payload: Dict[str, object]) -> TelemetryMetrics:
         ingestion_payload = payload.get("ingestion", {}) or {}
+        jobs_payload = payload.get("jobs", {}) or {}
         search_payload = payload.get("search", {}) or {}
         generation_payload = payload.get("generation", {}) or {}
         feedback_payload = payload.get("feedback", {}) or {}
@@ -339,6 +341,14 @@ class CatalystIndexClient:
                 latency_ms=self._parse_latency_summary(
                     ingestion_payload.get("latency_ms", {}) or {}
                 ),
+            ),
+            jobs=JobMetrics(
+                total=int(jobs_payload.get("total", 0) or 0),
+                by_status={
+                    str(key): int(value)
+                    for key, value in (jobs_payload.get("by_status", {}) or {}).items()
+                },
+                failed_documents=int(jobs_payload.get("failed_documents", 0) or 0),
             ),
             search=SearchMetrics(
                 requests=int(search_payload.get("requests", 0) or 0),

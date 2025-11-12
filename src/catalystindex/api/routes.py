@@ -261,6 +261,12 @@ class DependencyMetricsModel(BaseModel):
     retries: Dict[str, int]
 
 
+class JobMetricsModel(BaseModel):
+    total: int
+    by_status: Dict[str, int]
+    failed_documents: int
+
+
 class TelemetryExporterModel(BaseModel):
     enabled: bool
     running: bool
@@ -270,6 +276,7 @@ class TelemetryExporterModel(BaseModel):
 
 class TelemetryMetricsModel(BaseModel):
     ingestion: IngestionMetricsModel
+    jobs: JobMetricsModel
     search: SearchMetricsModel
     generation: GenerationMetricsModel
     feedback: FeedbackMetricsModel
@@ -638,6 +645,7 @@ def _latency_summary_to_model(summary: Dict[str, object]) -> LatencySummaryModel
 
 def _telemetry_to_model(snapshot: Dict[str, object]) -> TelemetryMetricsModel:
     ingestion = snapshot.get("ingestion", {}) or {}
+    jobs = snapshot.get("jobs", {}) or {}
     search = snapshot.get("search", {}) or {}
     generation = snapshot.get("generation", {}) or {}
     feedback = snapshot.get("feedback", {}) or {}
@@ -647,6 +655,11 @@ def _telemetry_to_model(snapshot: Dict[str, object]) -> TelemetryMetricsModel:
         ingestion=IngestionMetricsModel(
             chunks=int(ingestion.get("chunks", 0) or 0),
             latency_ms=_latency_summary_to_model(ingestion.get("latency_ms", {}) or {}),
+        ),
+        jobs=JobMetricsModel(
+            total=int(jobs.get("total", 0) or 0),
+            by_status={str(k): int(v) for k, v in (jobs.get("by_status", {}) or {}).items()},
+            failed_documents=int(jobs.get("failed_documents", 0) or 0),
         ),
         search=SearchMetricsModel(
             requests=int(search.get("requests", 0) or 0),
