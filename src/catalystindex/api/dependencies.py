@@ -33,7 +33,15 @@ from ..chunking.engine import ChunkingEngine
 
 @lru_cache
 def get_metrics() -> MetricsRecorder:
-    return MetricsRecorder()
+    settings = get_settings()
+    enable_prometheus = settings.features.enable_metrics
+    exporter_port = settings.metrics_exporter_port if enable_prometheus else None
+    return MetricsRecorder(
+        namespace=settings.telemetry_namespace,
+        enable_prometheus=enable_prometheus,
+        exporter_port=exporter_port,
+        exporter_address=settings.metrics_exporter_address,
+    )
 
 
 @lru_cache
@@ -289,6 +297,7 @@ def get_feedback_service() -> FeedbackService:
         term_index=get_term_index(),
         metrics=get_metrics(),
         audit_logger=get_audit_logger(),
+        vector_store=get_vector_store(),
     )
 
 
