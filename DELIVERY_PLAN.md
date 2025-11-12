@@ -76,9 +76,9 @@ Workstreams (parallel):
 **Goal:** Ensure system meets spec and is production-ready, covering acceptance criteria in `build_order_spec.md:50-70`, `security_tenancy_spec.md`, and test requirements in `ingestion_pipeline_spec.md:90-110`.
 
 Workstreams:
-- Scenario + load testing (ingestion batches, search concurrency, rerank latency) per `search_spec.md:78-91`.
-- Security review (JWT propagation, tenant filters, artifact access controls) referencing `security_tenancy_spec.md:10-55`.
-- Documentation updates (runbooks, spec alignment tables, SDK guides) aligning with all spec docs.
+- [x] Scenario + load testing (ingestion batches, search concurrency, rerank latency) per `search_spec.md:78-91`. *(Automated via `tests/perf` load scripts wired into CI.)*
+- [x] Security review (JWT propagation, tenant filters, artifact access controls) referencing `security_tenancy_spec.md:10-55`. *(Documented in `docs/security_review.md`.)*
+- [x] Documentation updates (runbooks, spec alignment tables, SDK guides) aligning with all spec docs. *(Spec alignment captured in `docs/spec_alignment_report.md`.)*
 
 ---
 This document should be kept in sync with implementation progress; mark tasks complete and adjust dependencies as we deliver new capabilities.
