@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from functools import lru_cache
@@ -30,6 +31,8 @@ from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
 from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from ..chunking.engine import ChunkingEngine
+
+LOGGER = logging.getLogger("catalystindex.dependencies")
 
 
 @lru_cache
@@ -95,6 +98,13 @@ def get_term_index() -> TermIndex:
         redis_settings = settings.storage.redis
         client = redis.Redis.from_url(redis_settings.url)
         return RedisTermIndex(client, ttl_seconds=redis_settings.ttl_seconds)
+    if settings.environment.lower() != "dev":
+        LOGGER.warning(
+            "term_index.in_memory",
+            extra={
+                "message": "Term index falling back to in-memory implementation. Configure redis to enable persistence.",
+            },
+        )
     return InMemoryTermIndex()
 
 
@@ -194,6 +204,19 @@ def get_ingestion_job_store() -> IngestionJobStore:
             redis_client = None
         else:
             redis_client = redis.Redis.from_url(redis_url)
+    elif settings.environment.lower() != "dev":
+        LOGGER.warning(
+            "jobs.redis_missing",
+            extra={"message": "Redis URL not configured for job store; job status caching is disabled."},
+        )
+    if not settings.jobs.store.postgres_dsn or settings.jobs.store.postgres_dsn.startswith("sqlite://"):
+        if settings.environment.lower() != "dev":
+            LOGGER.warning(
+                "jobs.in_memory_store",
+                extra={
+                    "message": "Ingestion job store is using SQLite/in-memory; configure Postgres for production.",
+                },
+            )
     return RedisPostgresIngestionJobStore(
         connection=get_job_store_connection(),
         redis_client=redis_client,

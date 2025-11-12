@@ -24,6 +24,15 @@ uv run uvicorn catalystindex.main:app --reload
 
 For end-to-end testing with the asynchronous ingestion queue, Redis/Postgres, and Qdrant, see [`docs/runtime_profiles.md`](docs/runtime_profiles.md). The repo ships with `infrastructure/docker-compose.dev.yml` to boot the supporting services and a helper worker runner under `scripts/run_worker.py`.
 
+Quick start for the real pipeline:
+
+```bash
+docker compose -f infrastructure/docker-compose.dev.yml up -d  # starts Postgres, Redis, Qdrant
+uv pip install -e .[dev,qdrant,openai]
+uv run uvicorn catalystindex.main:app --reload
+uv run python scripts/run_worker.py
+```
+
 Runtime settings can be overridden via environment variables using the pattern `CATALYST_<section>__<field>`. For example:
 
 ```bash
