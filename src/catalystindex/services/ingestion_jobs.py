@@ -14,6 +14,7 @@ from ..artifacts.store import ArtifactStore
 from ..models.common import ChunkRecord, Tenant
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from .ingestion import IngestionService
+from .policy_advisor import PolicyAdvisor, PolicyAdvice
 
 
 class IngestionJobStatus(str, Enum):
@@ -684,6 +685,7 @@ class IngestionCoordinator:
         policy_resolver,
         task_dispatcher: IngestionTaskDispatcher | None = None,
         retry_intervals: Sequence[int] | None = None,
+        policy_advisor: PolicyAdvisor | None = None,
     ) -> None:
         self._ingestion_service = ingestion_service
         self._acquisition = acquisition
@@ -694,6 +696,7 @@ class IngestionCoordinator:
         self._resolve_policy = policy_resolver
         self._task_dispatcher = task_dispatcher
         self._retry_intervals = tuple(retry_intervals or (15, 30, 60, 120))
+        self._policy_advisor = policy_advisor
 
     def ingest_document(self, tenant: Tenant, submission: DocumentSubmission) -> IngestionJobRecord:
         record = self._job_store.create(tenant, [submission])
@@ -787,7 +790,25 @@ class IngestionCoordinator:
             content_type=acquisition.content_type,
             metadata=acquisition.metadata,
         )
-        policy = self._resolve_policy(submission.document_title, submission.schema)
+        advisor_policy = None
+        advisor_metadata: Dict[str, object] = {}
+        if self._policy_advisor and not submission.schema:
+            preview = self._preview_text(acquisition.content)
+            advice = self._policy_advisor.advise(
+                title=submission.document_title,
+                schema=submission.schema,
+                content=preview,
+            )
+            if advice.policy_name:
+                advisor_policy = advice.policy_name
+            if advice.confidence is not None:
+                advisor_metadata["advisor_confidence"] = advice.confidence
+            if advice.notes:
+                advisor_metadata["advisor_notes"] = advice.notes
+            if advice.tags:
+                advisor_metadata["advisor_tags"] = advice.tags
+        policy_hint = submission.schema or advisor_policy
+        policy = self._resolve_policy(submission.document_title, policy_hint)
         parser_name = submission.parser_hint or acquisition.parser_hint or "plain_text"
         document_metadata = {
             **acquisition.metadata,
@@ -795,6 +816,9 @@ class IngestionCoordinator:
             "artifact_uri": artifact.uri,
             "source_type": submission.source_type,
         }
+        if advisor_policy:
+            document_metadata["advisor_policy"] = advisor_policy
+        document_metadata.update(advisor_metadata)
         if acquisition.content_type and "content_type" not in document_metadata:
             document_metadata["content_type"] = acquisition.content_type
         ingestion_result = self._ingestion_service.ingest(
@@ -844,6 +868,13 @@ class IngestionCoordinator:
             status=job.status.value,
             failed_documents=failed_documents,
         )
+
+    def _preview_text(self, content: bytes | str, limit: int = 4000) -> str:
+        if isinstance(content, bytes):
+            text = content.decode("utf-8", errors="ignore")
+        else:
+            text = content
+        return text[:limit]
 
 
 __all__ = [

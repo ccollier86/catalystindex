@@ -25,6 +25,7 @@ from ..services.ingestion_jobs import (
     IngestionTaskDispatcher,
     RedisPostgresIngestionJobStore,
 )
+from ..services.policy_advisor import PolicyAdvisor, PolicyAdvice
 from ..workers.dispatcher import RQIngestionTaskDispatcher
 from ..services.search import CohereReranker, EmbeddingReranker, OpenAIReranker, SearchService
 from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
@@ -277,7 +278,29 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         policy_resolver=resolve_policy,
         task_dispatcher=get_ingestion_task_dispatcher(),
         retry_intervals=settings.jobs.worker.retry_intervals,
+        policy_advisor=get_policy_advisor(),
     )
+
+
+@lru_cache
+def get_policy_advisor() -> PolicyAdvisor | None:
+    settings = get_settings()
+    advisor_settings = settings.policy_advisor
+    if not advisor_settings.enabled:
+        return None
+    api_key = advisor_settings.api_key or os.getenv("CATALYST_POLICY_ADVISOR__api_key") or os.getenv("OPENAI_API_KEY")
+    try:
+        return PolicyAdvisor(
+            enabled=advisor_settings.enabled,
+            provider=advisor_settings.provider,
+            model=advisor_settings.model or "gpt-4o-mini",
+            api_key=api_key,
+            base_url=advisor_settings.base_url,
+            sample_chars=advisor_settings.sample_chars,
+        )
+    except RuntimeError as exc:
+        LOGGER.warning("policy_advisor.disabled", extra={"error": str(exc)})
+        return None
 
 
 def _build_reranker(settings, embedding_provider):

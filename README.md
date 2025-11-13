@@ -40,6 +40,9 @@ export CATALYST_JOBS__store__postgres_dsn=postgresql://catalyst:catalyst@localho
 export CATALYST_STORAGE__vector_backend=qdrant
 export CATALYST_EMBEDDINGS__provider=openai
 export CATALYST_EMBEDDINGS__model=text-embedding-3-large
+export CATALYST_POLICY_ADVISOR__enabled=true
+export CATALYST_POLICY_ADVISOR__model=gpt-4o-mini
+```
 
 ### Enabling Firecrawl for URL ingestion
 

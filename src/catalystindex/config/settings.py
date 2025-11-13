@@ -83,6 +83,15 @@ class EmbeddingsSettings(BaseModel):
     dimension: int = Field(default=128, description="Expected embedding dimension")
 
 
+class PolicyAdvisorSettings(BaseModel):
+    enabled: bool = Field(default=False, description="Enable LLM-based policy advising")
+    provider: str = Field(default="openai", description="LLM provider")
+    model: str | None = Field(default="gpt-4o-mini", description="Model used for advising")
+    api_key: str | None = Field(default=None, description="API key for the provider")
+    base_url: str | None = Field(default=None, description="Optional base URL override")
+    sample_chars: int = Field(default=4000, description="How many characters of the document to sample")
+
+
 class RerankerSettings(BaseModel):
     enabled: bool = Field(default=False, description="Enable external reranker for premium mode")
     provider: str = Field(default="embedding", description="Reranker provider (embedding, cohere, openai)")
@@ -119,6 +128,7 @@ class AppSettings(BaseModel):
     features: FeatureFlags = Field(default_factory=FeatureFlags)
     embeddings: EmbeddingsSettings = Field(default_factory=EmbeddingsSettings)
     reranker: RerankerSettings = Field(default_factory=RerankerSettings)
+    policy_advisor: PolicyAdvisorSettings = Field(default_factory=PolicyAdvisorSettings)
     telemetry_namespace: str = "catalystindex"
     metrics_exporter_port: int | None = 9464
     metrics_exporter_address: str = "0.0.0.0"
