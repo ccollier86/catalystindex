@@ -5,25 +5,26 @@
 2. Map current service wiring (`src/catalystindex/...`): acquisition, policy resolver, parser registry, chunking, embeddings, search, job store, term index. Document gaps vs. checklist.
 
 ### B. Knowledge Base & Tenant Model
-3. Introduce persistent KB catalog in Postgres: table storing `knowledge_base_id`, owner metadata (org/workspace/user), description, document counts, keywords.  
-4. Extend ingestion request models to require/accept `knowledge_base_id`; create KB automatically when missing.  
-5. Update artifacts, chunk metadata, term index, and vector payloads to tag every record with KB ID.  
-6. Add API endpoints to list KBs, view KB metadata (documents, keywords), and enforce ownership checks in ingest/search.
+3. ✅ Introduce persistent KB catalog in Postgres: table storing `knowledge_base_id`, owner metadata (org/workspace/user), description, document counts, keywords.  
+4. ✅ Extend ingestion request models to require/accept `knowledge_base_id`; create KB automatically when missing.  
+5. ✅ Update artifacts, chunk metadata, term index, and vector payloads to tag every record with KB ID.  
+6. ✅ Add API endpoints to list KBs, view KB metadata (documents, keywords), and enforce ownership checks in ingest/search.
 
 ### C. Policy Advisor & Heuristic Removal
 7. ✅ Removed the title-based heuristic in `resolve_policy`; resolver now only honors explicit schema/advisor policy names.  
 8. Ensure advisor returns policy name, parser hint, chunk overrides; record them in document metadata (advisor confidence/tags).  
-9. Add dedicated policy templates for major document types (e.g., `ccbhc`) so the advisor can select them cleanly.
+9. Add dedicated policy templates for major document types (e.g., `ccbhc`) so the advisor can select them cleanly, and design an LLM-guided path for on-the-fly policies when no shared template fits (academic texts, research reports, ops manuals, etc.).  
+10. Build a reusable “LLM-assisted chunking & metadata strategy” module so when a document lacks a matching policy we can synthesize the slicing rules and metadata prompts (and optionally persist them for re-use) instead of falling back to the generic recipe.
 
 ### D. Parser & Ingestion Flow Enhancements
-10. Verify Unstructured adapters in Docker image include optional dependencies (pi_heif, etc.). Add fallback extraction (pypdf) when extras missing.  
-11. Ensure parser selection respects advisor hint → MIME → fallback, with warnings logged when falling back.  
+10. ✅ Verify Unstructured adapters in Docker image include optional dependencies (pi_heif, etc.). Add fallback extraction (pypdf) when extras missing.  
+11. ✅ Ensure parser selection respects advisor hint → MIME → fallback, with warnings logged when falling back.  
 12. Persist structured artifacts (`chunks.json`, `embeddings.json`, etc.) per doc and ensure stage progress is updated for parsed/chunked/embedded/uploaded.
 
 ### E. Embedding & Vector Store Configuration
-13. Configure API + worker containers to use real embedding provider (OpenAI/Cohere) from `.env`; drop hash provider except in explicit dev-lite mode.  
-14. Map each knowledge base to a Qdrant tenant/collection (or payload filter). Confirm sparse + dense vectors are stored for premium mode.  
-15. Wire reranker (Cohere/OpenAI) into the premium search pipeline; ensure economy mode can opt out.
+13. ✅ Configure API + worker containers to use real embedding provider (OpenAI/Cohere) from `.env`; drop hash provider except in explicit dev-lite mode.  
+14. ✅ Map each knowledge base to a Qdrant tenant/collection (isolated per track) and ensure sparse + dense vectors are stored for premium mode.  
+15. ✅ Wire reranker (Cohere/OpenAI) into the premium search pipeline; ensure economy mode can opt out.
 
 ### F. Search & Generation Paths
 16. Update `/search/query` to require KB list (or `["*"]`) and enforce KB ownership before querying vector store.  

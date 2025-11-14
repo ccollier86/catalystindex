@@ -56,14 +56,25 @@ POLICY_OVERRIDES: Dict[str, ChunkingPolicy] = {
         chunk_tiers=("semantic", "window"),
         llm_metadata=LLMMetadataConfig(enabled=True, model="gpt-4o-mini", summary_length=260, max_terms=10),
     ),
+    "ccbhc": ChunkingPolicy(
+        policy_name="ccbhc",
+        chunk_modes=("section", "window", "semantic"),
+        window_size=480,
+        window_overlap=96,
+        max_chunk_tokens=560,
+        chunk_tiers=("section", "semantic", "window"),
+        highlight_phrases=("staffing", "eligibility", "criteria", "services", "compliance"),
+        llm_metadata=LLMMetadataConfig(enabled=True, summary_length=280, max_terms=12),
+    ),
 }
 
 
-def resolve_policy(policy_name: str | None) -> ChunkingPolicy:
+def resolve_policy(policy_name: str | None, fallback: str | None = None) -> ChunkingPolicy:
     """Resolve chunking policy using explicit advisor/schema selection."""
 
-    if policy_name and policy_name in POLICY_OVERRIDES:
-        return POLICY_OVERRIDES[policy_name]
+    candidate = policy_name or fallback
+    if candidate and candidate in POLICY_OVERRIDES:
+        return POLICY_OVERRIDES[candidate]
 
     return DEFAULT_POLICY
 

@@ -13,6 +13,7 @@ from ..acquisition.service import AcquisitionService, URLFetcher
 from ..artifacts.store import ArtifactStore, InMemoryArtifactStore, LocalArtifactStore, S3ArtifactStore
 from ..auth.jwt import decode_jwt, ensure_scopes, extract_tenant
 from ..config.settings import get_settings
+from ..embeddings.base import EmbeddingProvider
 from ..embeddings.hash import HashEmbeddingProvider
 from ..parsers.registry import default_registry
 from ..policies.resolver import resolve_policy
@@ -25,6 +26,7 @@ from ..services.ingestion_jobs import (
     IngestionTaskDispatcher,
     RedisPostgresIngestionJobStore,
 )
+from ..services.knowledge_base import KnowledgeBaseStore
 from ..services.policy_advisor import PolicyAdvisor, PolicyAdvice
 from ..workers.dispatcher import RQIngestionTaskDispatcher
 from ..services.search import CohereReranker, EmbeddingReranker, OpenAIReranker, SearchService
@@ -113,20 +115,33 @@ def get_term_index() -> TermIndex:
 def get_embedding_provider() -> HashEmbeddingProvider:
     settings = get_settings()
     embeddings_settings = settings.embeddings
-    provider = (embeddings_settings.provider or "hash").lower()
+    provider = (embeddings_settings.provider or "openai").lower()
     if provider == "openai":
-        try:
-            from ..embeddings.openai import OpenAIEmbeddingProvider
-        except ModuleNotFoundError as exc:  # pragma: no cover - optional dep
-            raise RuntimeError(
-                "OpenAI embedding provider requested but 'openai' package is not installed. Install the 'openai' extra.",
-            ) from exc
-        api_key = embeddings_settings.api_key or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OpenAI embedding provider requires an API key (set OPENAI_API_KEY or CATALYST_EMBEDDINGS__api_key).")
-        model = embeddings_settings.model or "text-embedding-3-large"
-        return OpenAIEmbeddingProvider(api_key=api_key, model=model, base_url=embeddings_settings.base_url)
+        builder = _build_openai_embedding_provider(embeddings_settings)
+        if builder:
+            return builder
+        LOGGER.warning(
+            "embeddings.fallback",
+            extra={"provider": "openai", "detail": "Falling back to hash embeddings"},
+        )
+    elif provider not in {"hash", "dev_hash"}:
+        LOGGER.warning(
+            "embeddings.unknown_provider",
+            extra={"provider": provider},
+        )
     return HashEmbeddingProvider(dimension=embeddings_settings.dimension or settings.storage.vector_dimension)
+
+
+def _build_openai_embedding_provider(embeddings_settings) -> EmbeddingProvider | None:
+    try:
+        from ..embeddings.openai import OpenAIEmbeddingProvider
+    except ModuleNotFoundError:
+        return None
+    api_key = embeddings_settings.api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    model = embeddings_settings.model or "text-embedding-3-large"
+    return OpenAIEmbeddingProvider(api_key=api_key, model=model, base_url=embeddings_settings.base_url)
 
 
 @lru_cache
@@ -226,6 +241,11 @@ def get_ingestion_job_store() -> IngestionJobStore:
 
 
 @lru_cache
+def get_knowledge_base_store() -> KnowledgeBaseStore:
+    return KnowledgeBaseStore(connection=get_job_store_connection())
+
+
+@lru_cache
 def get_ingestion_task_dispatcher() -> IngestionTaskDispatcher | None:
     settings = get_settings()
     worker_settings = settings.jobs.worker
@@ -280,6 +300,7 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         retry_intervals=settings.jobs.worker.retry_intervals,
         policy_advisor=get_policy_advisor(),
         parser_registry=get_parser_registry(),
+        knowledge_base_store=get_knowledge_base_store(),
     )
 
 
@@ -314,14 +335,28 @@ def _build_reranker(settings, embedding_provider):
     if provider in ("none", "disabled"):
         return None
     if provider == "cohere":
+        api_key = reranker_config.api_key or os.getenv("COHERE_API_KEY")
+        if not api_key:
+            LOGGER.warning(
+                "reranker.cohere.no_api_key",
+                extra={"provider": "cohere", "detail": "Falling back to embedding reranker"},
+            )
+            return EmbeddingReranker(embedding_provider, weight=reranker_config.weight)
         return CohereReranker(
-            api_key=reranker_config.api_key,
+            api_key=api_key,
             model=reranker_config.model,
             top_n=reranker_config.top_n,
         )
     if provider == "openai":
+        api_key = reranker_config.api_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            LOGGER.warning(
+                "reranker.openai.no_api_key",
+                extra={"provider": "openai", "detail": "Falling back to embedding reranker"},
+            )
+            return EmbeddingReranker(embedding_provider, weight=reranker_config.weight)
         return OpenAIReranker(
-            api_key=reranker_config.api_key,
+            api_key=api_key,
             model=reranker_config.model,
             base_url=reranker_config.base_url,
             weight=reranker_config.weight,

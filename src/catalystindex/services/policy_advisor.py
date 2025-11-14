@@ -54,7 +54,8 @@ class PolicyAdvisor:
             return PolicyAdvice(policy_name=None, confidence=None, tags={}, notes=None)
         prompt = (
             "You are assisting a retrieval system by labeling documents with the best ingestion recipe and parser. "
-            "Known recipes: dsm5, treatment_planner, summary, general. If none match, return 'general'.\n"
+            "Known recipes: dsm5, ccbhc, treatment_planner, summary, general. If none match, return 'general'.\n"
+            "Use 'ccbhc' for Certified Community Behavioral Health Clinic criteria, compliance guides, or staffing/service standards.\n"
             f"Title: {title}\n"
             f"Provided schema hint: {schema or 'none'}\n"
             "Document preview:\n"

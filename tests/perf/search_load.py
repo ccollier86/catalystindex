@@ -14,7 +14,7 @@ for path in (str(PROJECT_ROOT), str(SRC_ROOT)):
         sys.path.insert(0, path)
 
 from catalystindex.services.search import SearchOptions
-from tests.perf.base import build_perf_context, cycle_queries, load_sample_corpus
+from tests.perf.base import PERF_KNOWLEDGE_BASE_ID, build_perf_context, cycle_queries, load_sample_corpus
 
 
 def run_search_load(iterations: int) -> Sequence[float]:
@@ -22,7 +22,7 @@ def run_search_load(iterations: int) -> Sequence[float]:
     load_sample_corpus(context, repeats=2)
     latencies: list[float] = []
     for mode, query in cycle_queries(iterations):
-        options = SearchOptions(mode=mode)
+        options = SearchOptions(mode=mode, knowledge_base_ids=(PERF_KNOWLEDGE_BASE_ID,))
         start = time.perf_counter()
         execution = context.search.retrieve(context.tenant, query=query, options=options)
         latency_ms = (time.perf_counter() - start) * 1000.0

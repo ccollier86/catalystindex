@@ -66,9 +66,10 @@ class IngestionService:
                 progress_callback(stage, status, details or {})
 
         start = perf_counter()
+        document_metadata = dict(document_metadata or {})
         parser = self._parser_registry.resolve(parser_name or self._default_parser)
         content_type = None
-        if document_metadata and isinstance(document_metadata.get("content_type"), str):
+        if isinstance(document_metadata.get("content_type"), str):
             content_type = document_metadata.get("content_type")
         emit("parsed", "running", {"parser": parser.__class__.__name__})
         try:
@@ -90,7 +91,7 @@ class IngestionService:
                 document_id,
                 chunk,
                 policy,
-                document_metadata=document_metadata or {},
+                document_metadata=document_metadata,
             )
             for chunk in self._chunking_engine.generate_chunks(sections, policy, document_id)
         ]
@@ -109,8 +110,17 @@ class IngestionService:
             emit("embedded", "failed", {"error": str(exc)})
             raise
         emit("embedded", "succeeded", {"count": len(embeddings)})
+        kb_value = document_metadata.get("knowledge_base_id")
+        knowledge_base_id = str(kb_value) if kb_value else None
+        if not knowledge_base_id:
+            raise ValueError("knowledge_base_id metadata is required for vector storage")
         documents = [
-            VectorDocument(chunk=chunk, vector=embedding, track="text")
+            VectorDocument(
+                chunk=chunk,
+                vector=embedding,
+                track="text",
+                knowledge_base_id=knowledge_base_id,
+            )
             for chunk, embedding in zip(chunks, embeddings)
         ]
         emit("uploaded", "running", {"documents": len(documents)})
@@ -164,8 +174,9 @@ class IngestionService:
             confidence_note=confidence_note,
             metadata=metadata,
         )
-        if key_terms:
-            self._term_index.update(tenant, document_id, chunk.chunk_id, key_terms)
+        knowledge_base_id = str(document_metadata.get("knowledge_base_id") or "")
+        if key_terms and knowledge_base_id:
+            self._term_index.update(tenant, knowledge_base_id, document_id, chunk.chunk_id, key_terms)
         return enriched
 
 

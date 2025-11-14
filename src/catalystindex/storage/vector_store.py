@@ -13,6 +13,7 @@ class VectorDocument:
     chunk: ChunkRecord
     vector: Sequence[float]
     track: str
+    knowledge_base_id: str
     sparse_vector: Mapping[int, float] | None = None
 
 
@@ -139,17 +140,21 @@ class QdrantVectorStore(VectorStoreClient):
         self._sparse_enabled = sparse_enabled
         self._metadata_fields = metadata_fields or {}
         self._known_tracks: set[str] = set()
+        self._known_collections: set[tuple[str, str]] = set()
 
     def upsert(self, tenant: Tenant, documents: Iterable[VectorDocument]) -> None:
-        grouped: Dict[str, List[VectorDocument]] = defaultdict(list)
+        grouped: Dict[tuple[str, str], List[VectorDocument]] = defaultdict(list)
         for document in documents:
-            grouped[document.track].append(document)
-        for track, docs in grouped.items():
-            collection = self._collection_name(track)
+            if not document.knowledge_base_id:
+                raise ValueError("knowledge_base_id is required for Qdrant upsert")
+            grouped[(document.track, document.knowledge_base_id)].append(document)
+        for (track, kb_id), docs in grouped.items():
+            collection = self._collection_name(track, kb_id)
             self._ensure_collection(collection)
             points = [self._build_point(tenant, doc) for doc in docs]
             self._client.upsert(collection_name=collection, points=points)
             self._known_tracks.add(track)
+            self._known_collections.add((track, kb_id))
 
     def query(
         self,
@@ -161,27 +166,32 @@ class QdrantVectorStore(VectorStoreClient):
         filters: Dict[str, object] | None = None,
         sparse_vector: Mapping[int, float] | None = None,
     ) -> List[RetrievalResult]:
-        collection = self._collection_name(track)
-        if not self._collection_exists(collection):
-            return []
-        qdrant_filter = self._build_filter(tenant, track, filters)
-        search_params = self._rest.SearchParams(exact=False)
-        search_kwargs = {
-            "collection_name": collection,
-            "query_vector": vector,
-            "query_filter": qdrant_filter,
-            "limit": limit,
-            "search_params": search_params,
-        }
-        if sparse_vector and self._sparse_enabled:
-            sparse_class = getattr(self._rest, "SparseVector", None)
-            if sparse_class is None:
-                raise RuntimeError("Sparse vector queries require qdrant-client with sparse vector support enabled.")
-            search_kwargs["query_sparse_vector"] = sparse_class(
-                indices=list(sparse_vector.keys()),
-                values=list(sparse_vector.values()),
-            )
-        results = self._client.search(**search_kwargs)
+        filters = dict(filters or {})
+        kb_filters = self._extract_kb_filters(filters)
+        aggregated: List[RetrievalResult] = []
+        for kb_id in kb_filters:
+            collection = self._collection_name(track, kb_id)
+            if not self._collection_exists(collection):
+                continue
+            qdrant_filter = self._build_filter(tenant, track, filters, kb_id)
+            search_params = self._rest.SearchParams(exact=False)
+            search_kwargs = {
+                "collection_name": collection,
+                "query_vector": vector,
+                "query_filter": qdrant_filter,
+                "limit": limit,
+                "search_params": search_params,
+            }
+            if sparse_vector and self._sparse_enabled:
+                sparse_class = getattr(self._rest, "SparseVector", None)
+                if sparse_class is None:
+                    raise RuntimeError("Sparse vector queries require qdrant-client with sparse vector support enabled.")
+                search_kwargs["query_sparse_vector"] = sparse_class(
+                    indices=list(sparse_vector.keys()),
+                    values=list(sparse_vector.values()),
+                )
+            aggregated.extend(self._client.search(**search_kwargs))
+        results = aggregated
         retrievals: List[RetrievalResult] = []
         for point in results:
             payload = point.payload or {}
@@ -238,8 +248,8 @@ class QdrantVectorStore(VectorStoreClient):
             return
         point_ids = [self._point_id(tenant, chunk_id) for chunk_id in identifiers]
         adjustment = 1 if positive else -1
-        for track in list(self._known_tracks):
-            collection = self._collection_name(track)
+        for track, kb_id in list(self._known_collections):
+            collection = self._collection_name(track, kb_id)
             if not self._collection_exists(collection):
                 continue
             try:
@@ -279,8 +289,9 @@ class QdrantVectorStore(VectorStoreClient):
                 )
 
     # Internal helpers -------------------------------------------------
-    def _collection_name(self, track: str) -> str:
-        return f"{self._collection_prefix}_{track}"
+    def _collection_name(self, track: str, knowledge_base_id: str) -> str:
+        safe_kb = knowledge_base_id.replace(":", "-")
+        return f"{self._collection_prefix}_{track}_{safe_kb}"
 
     def _point_id(self, tenant: Tenant, chunk_id: str) -> str:
         return f"{tenant.org_id}:{tenant.workspace_id}:{chunk_id}"
@@ -311,6 +322,20 @@ class QdrantVectorStore(VectorStoreClient):
         except Exception:  # pragma: no cover - passthrough to qdrant
             return False
 
+    def _extract_kb_filters(self, filters: Dict[str, object]) -> List[str]:
+        value = filters.pop("knowledge_base_id", None)
+        if value is None:
+            raise ValueError("knowledge_base_id filter is required for Qdrant queries")
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Iterable):
+            result = []
+            for item in value:
+                if item:
+                    result.append(str(item))
+            return result
+        return []
+
     def _build_point(self, tenant: Tenant, document: VectorDocument):
         from qdrant_client.http import models as rest
 
@@ -323,6 +348,7 @@ class QdrantVectorStore(VectorStoreClient):
             "section_slug": document.chunk.section_slug,
             "vision_context": document.chunk.metadata.get("vision"),
         }
+        payload["knowledge_base_id"] = document.knowledge_base_id
         policy = document.chunk.metadata.get("policy")
         if policy:
             payload["policy"] = policy
@@ -348,6 +374,7 @@ class QdrantVectorStore(VectorStoreClient):
         tenant: Tenant,
         track: str,
         filters: Dict[str, object] | None,
+        knowledge_base_id: str,
     ):
         from qdrant_client.http import models as rest
 
@@ -355,6 +382,7 @@ class QdrantVectorStore(VectorStoreClient):
             rest.FieldCondition(key="tenant_org", match=rest.MatchValue(value=tenant.org_id)),
             rest.FieldCondition(key="tenant_workspace", match=rest.MatchValue(value=tenant.workspace_id)),
             rest.FieldCondition(key="track", match=rest.MatchValue(value=track)),
+            rest.FieldCondition(key="knowledge_base_id", match=rest.MatchValue(value=knowledge_base_id)),
         ]
         for key, value in (filters or {}).items():
             if value is None:
@@ -381,6 +409,8 @@ def _matches_filters(chunk: ChunkRecord, filters: Dict[str, object]) -> bool:
             candidate = chunk.chunk_tier
         elif key == "policy":
             candidate = chunk.metadata.get("policy")
+        elif key == "knowledge_base_id":
+            candidate = chunk.metadata.get("knowledge_base_id")
         else:
             candidate = chunk.metadata.get(key)
         if isinstance(value, (list, tuple, set)):

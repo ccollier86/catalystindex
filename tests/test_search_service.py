@@ -37,20 +37,29 @@ def test_search_returns_results_sorted_by_score():
         reranker=EmbeddingReranker(embedding_provider),
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
+    kb_id = "kb-test"
     chunks = [
         build_chunk("doc|body|1", "trauma exposure treatment"),
         build_chunk("doc|body|2", "diagnostic criteria ptsd"),
     ]
     for chunk in chunks:
         chunk.key_terms = ["post-traumatic stress"]
-        term_index.update(tenant, "doc", chunk.chunk_id, chunk.key_terms)
+        chunk.metadata["knowledge_base_id"] = kb_id
+        term_index.update(tenant, kb_id, "doc", chunk.chunk_id, chunk.key_terms)
     embeddings = list(embedding_provider.embed([chunk.text for chunk in chunks]))
     vector_store.upsert(
         tenant,
-        [VectorDocument(chunk=chunk, vector=vec, track="text") for chunk, vec in zip(chunks, embeddings)],
+        [
+            VectorDocument(chunk=chunk, vector=vec, track="text", knowledge_base_id=kb_id)
+            for chunk, vec in zip(chunks, embeddings)
+        ],
     )
 
-    execution = service.retrieve(tenant, query="ptsd trauma", options=SearchOptions(limit=2))
+    execution = service.retrieve(
+        tenant,
+        query="ptsd trauma",
+        options=SearchOptions(limit=2, knowledge_base_ids=(kb_id,)),
+    )
     assert len(execution.results) == 2
     assert execution.results[0].score >= execution.results[1].score
     assert execution.explanations
@@ -70,14 +79,19 @@ def test_search_debug_information_includes_aliases_and_tracks():
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
     chunk = build_chunk("doc|body|1", "behavioral activation helps")
     chunk.key_terms = ["behavioral activation", "pleasant activities scheduling"]
-    term_index.update(tenant, "doc", chunk.chunk_id, chunk.key_terms)
+    kb_id = "kb-test"
+    chunk.metadata["knowledge_base_id"] = kb_id
+    term_index.update(tenant, kb_id, "doc", chunk.chunk_id, chunk.key_terms)
     embedding = next(iter(embedding_provider.embed([chunk.text])))
-    vector_store.upsert(tenant, [VectorDocument(chunk=chunk, vector=embedding, track="text")])
+    vector_store.upsert(
+        tenant,
+        [VectorDocument(chunk=chunk, vector=embedding, track="text", knowledge_base_id=kb_id)],
+    )
 
     execution = service.retrieve(
         tenant,
         query="behavioral activation",
-        options=SearchOptions(limit=1, debug=True, alias_limit=5),
+        options=SearchOptions(limit=1, debug=True, alias_limit=5, knowledge_base_ids=(kb_id,)),
     )
     assert execution.debug is not None
     assert "behavioral" in execution.debug.expanded_query
@@ -100,7 +114,10 @@ def test_premium_mode_uses_custom_reranker():
     embeddings = list(embedding_provider.embed([chunk.text for chunk in chunks]))
     vector_store.upsert(
         tenant,
-        [VectorDocument(chunk=chunk, vector=vec, track="text") for chunk, vec in zip(chunks, embeddings)],
+        [
+            VectorDocument(chunk=chunk, vector=vec, track="text", knowledge_base_id="kb-test")
+            for chunk, vec in zip(chunks, embeddings)
+        ],
     )
 
     baseline_service = SearchService(
@@ -113,7 +130,7 @@ def test_premium_mode_uses_custom_reranker():
     baseline = baseline_service.retrieve(
         tenant,
         query="query",
-        options=SearchOptions(limit=2, mode="premium"),
+        options=SearchOptions(limit=2, mode="premium", knowledge_base_ids=("kb-test",)),
     )
     baseline_order = [result.chunk.chunk_id for result in baseline.results]
 
@@ -129,6 +146,6 @@ def test_premium_mode_uses_custom_reranker():
     execution = service.retrieve(
         tenant,
         query="query",
-        options=SearchOptions(limit=2, mode="premium"),
+        options=SearchOptions(limit=2, mode="premium", knowledge_base_ids=("kb-test",)),
     )
     assert [result.chunk.chunk_id for result in execution.results] == list(reversed(baseline_order))

@@ -34,7 +34,9 @@ ingestion = [
     "pillow>=10.0.0",
     "pypdf>=4.0.0",
     "python-magic>=0.4.27",
-    "unstructured>=0.15.8",
+    "pi-heif>=0.7.0",
+    "pikepdf>=8.15.1",
+    "unstructured[pdf,pptx,docx,xlsx,image]>=0.15.8",
 ]
 
 [tool.pytest.ini_options]

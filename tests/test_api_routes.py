@@ -37,12 +37,14 @@ def test_ingest_and_search_flow():
     token = build_token(["ingest:write", "search:read", "generate:write", "feedback:write"])
     headers = {"Authorization": f"Bearer {token}"}
 
+    knowledge_base_id = "kb-api"
     ingest_response = client.post(
         "/ingest/document",
         json={
             "document_id": "doc-1",
             "document_title": "PTSD Criteria",
             "content": "Criterion A. Exposure to trauma Criterion B. Intrusion",
+            "knowledge_base_id": knowledge_base_id,
         },
         headers=headers,
     )
@@ -54,7 +56,7 @@ def test_ingest_and_search_flow():
 
     search_response = client.post(
         "/search/query",
-        json={"query": "trauma exposure", "debug": True},
+        json={"query": "trauma exposure", "debug": True, "knowledge_base_ids": [knowledge_base_id]},
         headers=headers,
     )
     assert search_response.status_code == 200
@@ -68,7 +70,7 @@ def test_ingest_and_search_flow():
 
     generation_response = client.post(
         "/generate/summary",
-        json={"query": "summarize ptsd"},
+        json={"query": "summarize ptsd", "knowledge_base_ids": [knowledge_base_id]},
         headers=headers,
     )
     assert generation_response.status_code == 200

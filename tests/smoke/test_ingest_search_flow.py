@@ -41,12 +41,14 @@ def test_ingest_and_search_round_trip():
     app = create_app()
     client = TestClient(app)
     headers = _auth_headers("ingest:write", "ingest:read", "search:read")
+    knowledge_base_id = "kb-smoke"
     ingest_payload = {
         "document_id": "demo-doc",
         "document_title": "Demo Criteria",
         "content": "Criterion A. Exposure to trauma Criterion B. Intrusion",
         "schema": "dsm5",
         "parser_hint": "plain_text",
+        "knowledge_base_id": knowledge_base_id,
     }
     ingest_response = client.post("/ingest/document", json=ingest_payload, headers=headers)
     assert ingest_response.status_code == 200, ingest_response.text
@@ -58,7 +60,12 @@ def test_ingest_and_search_round_trip():
         status_data = status_resp.json()
         assert status_data["documents_completed"] >= 1
 
-    search_payload = {"query": "ptsd trauma", "mode": "economy", "debug": True}
+    search_payload = {
+        "query": "ptsd trauma",
+        "mode": "economy",
+        "debug": True,
+        "knowledge_base_ids": [knowledge_base_id],
+    }
     search_resp = client.post("/search/query", json=search_payload, headers=headers)
     assert search_resp.status_code == 200, search_resp.text
     search_data = search_resp.json()

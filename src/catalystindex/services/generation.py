@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 from ..models.common import RetrievalResult, Tenant
 from ..telemetry.logger import AuditLogger, MetricsRecorder
@@ -24,11 +24,22 @@ class GenerationService:
         self._metrics = metrics
         self._audit_logger = audit_logger
 
-    def summarize(self, tenant: Tenant, *, query: str, limit: int = 6) -> GenerationResponse:
+    def summarize(
+        self,
+        tenant: Tenant,
+        *,
+        query: str,
+        knowledge_base_ids: Sequence[str],
+        limit: int = 6,
+    ) -> GenerationResponse:
         from .search import SearchOptions
 
         start = perf_counter()
-        execution = self._search_service.retrieve(tenant, query=query, options=SearchOptions(limit=limit))
+        execution = self._search_service.retrieve(
+            tenant,
+            query=query,
+            options=SearchOptions(limit=limit, knowledge_base_ids=tuple(knowledge_base_ids)),
+        )
         limited = execution.results[:limit]
         summary_lines = []
         citations: Dict[str, Dict[str, object]] = {}

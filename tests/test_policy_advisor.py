@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from catalystindex.models.common import SectionText, Tenant
 from catalystindex.services.ingestion import IngestionService
 from catalystindex.services.ingestion_jobs import DocumentSubmission, IngestionCoordinator, RedisPostgresIngestionJobStore
+from catalystindex.services.knowledge_base import KnowledgeBaseStore
 from catalystindex.services.policy_advisor import PolicyAdvice
 from catalystindex.chunking.engine import ChunkingEngine
 from catalystindex.embeddings.hash import HashEmbeddingProvider
@@ -44,6 +45,7 @@ def test_policy_advisor_influences_policy_selection():
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     coordinator = IngestionCoordinator(
         ingestion_service=ingestion,
         acquisition=AcquisitionService(),
@@ -54,11 +56,13 @@ def test_policy_advisor_influences_policy_selection():
         policy_resolver=resolve_policy,
         policy_advisor=StubAdvisor(PolicyAdvice(policy_name="treatment_planner", confidence=0.9, tags={"doc_type": "treatment"}, notes=None)),
         parser_registry=default_registry(),
+        knowledge_base_store=kb_store,
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="u1")
     submission = DocumentSubmission(
         document_id="doc-policy",
         document_title="Behavioral Activation Plan",
+        knowledge_base_id="kb-policy",
         schema=None,
         source_type="inline",
         parser_hint="plain_text",
@@ -99,6 +103,7 @@ def test_policy_advisor_sets_parser_and_overrides():
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     advisor = StubAdvisor(
         PolicyAdvice(
             policy_name="dsm5",
@@ -119,11 +124,13 @@ def test_policy_advisor_sets_parser_and_overrides():
         policy_resolver=resolve_policy,
         policy_advisor=advisor,
         parser_registry=registry,
+        knowledge_base_store=kb_store,
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="u1")
     submission = DocumentSubmission(
         document_id="doc-advisor-parser",
         document_title="Unknown PDF",
+        knowledge_base_id="kb-advisor",
         schema=None,
         source_type="inline",
         parser_hint=None,
@@ -136,3 +143,11 @@ def test_policy_advisor_sets_parser_and_overrides():
     assert document.parser == "pdf"
     assert document.metadata.get("advisor_parser") == "pdf"
     assert document.metadata.get("advisor_policy_overrides") == {"chunk_modes": ["window"], "window_overlap": 40}
+
+
+def test_resolve_ccbhc_policy_template():
+    policy = resolve_policy("ccbhc")
+    assert policy.policy_name == "ccbhc"
+    assert "section" in policy.chunk_modes
+    assert policy.llm_metadata.enabled is True
+    assert policy.window_size == 480

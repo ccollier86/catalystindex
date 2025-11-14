@@ -18,6 +18,7 @@ from catalystindex.services.ingestion_jobs import (
     IngestionJobStatus,
     RedisPostgresIngestionJobStore,
 )
+from catalystindex.services.knowledge_base import KnowledgeBaseStore
 from catalystindex.storage.term_index import InMemoryTermIndex
 from catalystindex.storage.vector_store import InMemoryVectorStore
 from catalystindex.telemetry.logger import AuditLogger, MetricsRecorder
@@ -42,6 +43,7 @@ def test_ingestion_generates_chunks():
         document_title="DSM Criteria",
         content="Criterion A. Exposure to trauma Criterion B. Intrusion",
         policy=policy,
+        document_metadata={"knowledge_base_id": "kb-test"},
     )
 
     assert result.document_id == "doc-1"
@@ -64,6 +66,7 @@ def test_ingestion_coordinator_creates_job():
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     coordinator = IngestionCoordinator(
         ingestion_service=service,
         acquisition=AcquisitionService(),
@@ -73,11 +76,13 @@ def test_ingestion_coordinator_creates_job():
         audit_logger=AuditLogger(),
         policy_resolver=resolve_policy,
         parser_registry=default_registry(),
+        knowledge_base_store=kb_store,
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
     submission = DocumentSubmission(
         document_id="doc-2",
         document_title="Treatment Plan",
+        knowledge_base_id="kb-treatment",
         schema="treatment_planner",
         source_type="inline",
         parser_hint="plain_text",
@@ -94,6 +99,7 @@ def test_ingestion_coordinator_creates_job():
     assert document.chunk_count > 0
     assert document.metadata["source_type"] == "inline"
     assert document.metadata["source_label"] == "unit-test"
+    assert document.metadata["parser_source"] == "submission"
     assert document.artifact_uri is not None
     assert document.artifact_metadata["payload_size"] > 0
     assert document.progress["acquired"]["status"] == "succeeded"
@@ -104,6 +110,7 @@ def test_ingest_bulk_enqueues_tasks():
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     service = IngestionService(
         parser_registry=default_registry(),
         chunking_engine=ChunkingEngine(namespace="test"),
@@ -140,6 +147,7 @@ def test_ingest_bulk_enqueues_tasks():
         task_dispatcher=dispatcher,
         retry_intervals=(5, 10, 20),
         parser_registry=default_registry(),
+        knowledge_base_store=kb_store,
     )
 
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
@@ -147,6 +155,7 @@ def test_ingest_bulk_enqueues_tasks():
         DocumentSubmission(
             document_id=f"doc-{idx}",
             document_title=f"Document {idx}",
+            knowledge_base_id=f"kb-{idx}",
             schema=None,
             source_type="inline",
             parser_hint=None,
@@ -178,6 +187,7 @@ def test_ingestion_persists_pipeline_artifacts(tmp_path):
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     coordinator = IngestionCoordinator(
         ingestion_service=service,
@@ -188,11 +198,13 @@ def test_ingestion_persists_pipeline_artifacts(tmp_path):
         audit_logger=AuditLogger(),
         policy_resolver=resolve_policy,
         parser_registry=default_registry(),
+        knowledge_base_store=kb_store,
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
     submission = DocumentSubmission(
         document_id="doc-artifacts",
         document_title="DSM Criteria",
+        knowledge_base_id="kb-artifacts",
         schema="dsm5",
         source_type="inline",
         parser_hint="plain_text",
@@ -259,6 +271,7 @@ def test_content_type_infers_pdf_parser(tmp_path):
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
     coordinator = IngestionCoordinator(
         ingestion_service=service,
         acquisition=AcquisitionService(),
@@ -268,11 +281,13 @@ def test_content_type_infers_pdf_parser(tmp_path):
         audit_logger=AuditLogger(),
         policy_resolver=resolve_policy,
         parser_registry=registry,
+        knowledge_base_store=kb_store,
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="user")
     submission = DocumentSubmission(
         document_id="doc-pdf",
         document_title="PDF Upload",
+        knowledge_base_id="kb-pdf",
         schema=None,
         source_type="inline",
         parser_hint=None,
@@ -285,3 +300,4 @@ def test_content_type_infers_pdf_parser(tmp_path):
     document = job.documents[0]
     assert document.parser == "pdf"
     assert dummy_parser.calls == 1
+    assert document.metadata["parser_source"] == "acquisition"

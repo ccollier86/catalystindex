@@ -58,20 +58,29 @@ def _chunk(chunk_id: str) -> ChunkRecord:
         requires_previous=False,
         prev_chunk_id=None,
         confidence_note=None,
-        metadata={"policy": "dsm5"},
+        metadata={"policy": "dsm5", "knowledge_base_id": "kb-integration"},
     )
 
 
 def test_qdrant_vector_store_round_trip(qdrant_store):
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="tester")
-    doc = VectorDocument(chunk=_chunk("chunk-1"), vector=[0.1, 0.3, 0.4, 0.2], track="text")
+    doc = VectorDocument(
+        chunk=_chunk("chunk-1"),
+        vector=[0.1, 0.3, 0.4, 0.2],
+        track="text",
+        knowledge_base_id="kb-integration",
+    )
     qdrant_store.upsert(tenant, [doc])
     results = qdrant_store.query(
         tenant,
         [0.1, 0.2, 0.3, 0.4],
         track="text",
         limit=5,
-        filters={"policy": "dsm5", "chunk_tier": "criteria"},
+        filters={
+            "policy": "dsm5",
+            "chunk_tier": "criteria",
+            "knowledge_base_id": ["kb-integration"],
+        },
     )
     assert results, "Expected at least one retrieval"
     assert results[0].chunk.chunk_id == "chunk-1"

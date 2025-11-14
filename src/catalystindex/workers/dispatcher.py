@@ -86,6 +86,7 @@ def _serialize_submission(submission: DocumentSubmission) -> Dict[str, object]:
     return {
         "document_id": submission.document_id,
         "document_title": submission.document_title,
+        "knowledge_base_id": submission.knowledge_base_id,
         "schema": submission.schema,
         "source_type": submission.source_type,
         "parser_hint": submission.parser_hint,

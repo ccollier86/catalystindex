@@ -25,6 +25,7 @@ class SearchOptions:
     alias_limit: int = 5
     alias_enabled: bool = True
     debug: bool = False
+    knowledge_base_ids: Tuple[str, ...] | None = None
 
     @property
     def economy_mode(self) -> bool:
@@ -95,6 +96,8 @@ class SearchService:
 
     def retrieve(self, tenant: Tenant, *, query: str, options: SearchOptions | None = None) -> SearchExecution:
         options = options or SearchOptions()
+        if not options.knowledge_base_ids:
+            raise ValueError("knowledge_base_ids must be provided for search")
         normalized_mode = options.mode.lower()
         start = perf_counter()
         analysis = self._analyze_query(query)
@@ -108,7 +111,7 @@ class SearchService:
             sparse_query = self._build_sparse_query(expanded_query)
         for track in track_options:
             track_limit = track.limit or limit
-            filters = self._merge_filters(options.filters, track.filters)
+            filters = self._merge_filters(options.filters, track.filters, options.knowledge_base_ids)
             try:
                 results = self._vector_store.query(
                     tenant,
@@ -163,7 +166,12 @@ class SearchService:
     def _expand_query(self, tenant: Tenant, query: str, options: SearchOptions) -> Tuple[str, Tuple[str, ...]]:
         if not self._term_index or not options.alias_enabled:
             return query, ()
-        aliases = self._term_index.expand_query(tenant, query, limit=options.alias_limit)
+        aliases = self._term_index.expand_query(
+            tenant,
+            query,
+            knowledge_base_ids=options.knowledge_base_ids,
+            limit=options.alias_limit,
+        )
         unique_aliases = tuple(dict.fromkeys(aliases)) if aliases else ()
         if not unique_aliases:
             return query, ()
@@ -248,14 +256,15 @@ class SearchService:
         self,
         base: Dict[str, object] | None,
         specific: Dict[str, object] | None,
+        knowledge_base_ids: Tuple[str, ...],
     ) -> Dict[str, object] | None:
-        if not base and not specific:
-            return None
         merged: Dict[str, object] = {}
         if base:
             merged.update(base)
         if specific:
             merged.update(specific)
+        if knowledge_base_ids:
+            merged["knowledge_base_id"] = list(dict.fromkeys(knowledge_base_ids))
         sanitized = {key: value for key, value in merged.items() if value is not None}
         return sanitized or None
 

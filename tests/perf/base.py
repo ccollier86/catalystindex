@@ -65,6 +65,8 @@ SAMPLE_DOCUMENTS: Sequence[dict[str, object]] = (
     },
 )
 
+PERF_KNOWLEDGE_BASE_ID = "kb-perf"
+
 SAMPLE_QUERIES: Sequence[str] = (
     "What are the PTSD diagnostic criteria?",
     "How do we structure behavioral activation homework?",
@@ -124,6 +126,7 @@ def load_sample_corpus(context: PerfContext, *, repeats: int = 1) -> List[str]:
         for spec in SAMPLE_DOCUMENTS:
             document_id = f"{spec['document_id']}-{cycle}"
             policy = resolve_policy(str(spec["policy"]), str(spec["schema"]))
+            metadata = {"source": "perf-suite", "knowledge_base_id": PERF_KNOWLEDGE_BASE_ID}
             result = context.ingestion.ingest(
                 tenant=context.tenant,
                 document_id=document_id,
@@ -131,7 +134,7 @@ def load_sample_corpus(context: PerfContext, *, repeats: int = 1) -> List[str]:
                 content=str(spec["content"]),
                 policy=policy,
                 parser_name="plain_text",
-                document_metadata={"source": "perf-suite"},
+                document_metadata=metadata,
             )
             if not result.chunks:
                 raise RuntimeError(f"Ingestion returned no chunks for {document_id}")
@@ -153,6 +156,7 @@ __all__ = [
     "PerfContext",
     "SAMPLE_DOCUMENTS",
     "SAMPLE_QUERIES",
+    "PERF_KNOWLEDGE_BASE_ID",
     "build_perf_context",
     "load_sample_corpus",
     "cycle_queries",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ from .dependencies import (
     get_ingestion_coordinator,
     get_metrics,
     get_search_service,
+    get_knowledge_base_store,
     require_scopes,
 )
 
@@ -28,6 +29,7 @@ router = APIRouter()
 class IngestRequest(BaseModel):
     document_id: str
     document_title: str
+    knowledge_base_id: str
     content: str | None = None
     schema: str | None = None
     parser_hint: str | None = Field(default=None)
@@ -66,6 +68,7 @@ class ArtifactModel(BaseModel):
 
 class DocumentResultModel(BaseModel):
     document_id: str
+    knowledge_base_id: str
     status: str
     policy: str | None = None
     chunk_count: int = 0
@@ -96,6 +99,21 @@ class BulkIngestResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     retry_intervals: List[int] | None = None
+
+
+class KnowledgeBaseModel(BaseModel):
+    knowledge_base_id: str
+    description: str | None = None
+    document_count: int
+    keywords: List[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    last_document_title: str | None = None
+    last_ingested_at: datetime | None = None
+
+
+class KnowledgeBaseListResponse(BaseModel):
+    knowledge_bases: List[KnowledgeBaseModel]
 
 
 class JobSummaryModel(BaseModel):
@@ -135,6 +153,7 @@ class SearchRequest(BaseModel):
     filters: dict | None = None
     alias: AliasOptionsModel | None = None
     debug: bool = Field(default=False)
+    knowledge_base_ids: List[str] = Field(default_factory=lambda: ["*"])
 
 
 class RetrievalModel(BaseModel):
@@ -181,6 +200,7 @@ class SearchResponse(BaseModel):
 class GenerationRequest(BaseModel):
     query: str
     limit: int = 6
+    knowledge_base_ids: List[str] = Field(default_factory=lambda: ["*"])
 
 
 class GenerationResponseModel(BaseModel):
@@ -311,6 +331,7 @@ def ingest_document(
     submission = DocumentSubmission(
         document_id=request.document_id,
         document_title=request.document_title,
+        knowledge_base_id=request.knowledge_base_id,
         schema=request.schema,
         source_type=request.source_type,
         parser_hint=request.parser_hint,
@@ -340,6 +361,7 @@ def ingest_bulk(
         DocumentSubmission(
             document_id=item.document_id,
             document_title=item.document_title,
+            knowledge_base_id=item.knowledge_base_id,
             schema=item.schema,
             source_type=item.source_type,
             parser_hint=item.parser_hint,
@@ -358,6 +380,29 @@ def ingest_bulk(
         updated_at=job.updated_at,
         retry_intervals=list(coordinator.retry_intervals),
     )
+
+
+@router.get("/knowledge-bases", response_model=KnowledgeBaseListResponse)
+def list_knowledge_bases(
+    scopes = Depends(require_scopes("ingest:read")),
+    store = Depends(get_knowledge_base_store),
+):
+    _claims, tenant = scopes
+    records = store.list(tenant)
+    return KnowledgeBaseListResponse(knowledge_bases=[_knowledge_base_to_model(record) for record in records])
+
+
+@router.get("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseModel)
+def get_knowledge_base(
+    knowledge_base_id: str,
+    scopes = Depends(require_scopes("ingest:read")),
+    store = Depends(get_knowledge_base_store),
+):
+    _claims, tenant = scopes
+    record = store.get(tenant, knowledge_base_id)
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="knowledge base not found")
+    return _knowledge_base_to_model(record)
 
 
 @router.get("/ingest/jobs", response_model=List[JobSummaryModel])
@@ -430,8 +475,10 @@ def search_query(
     request: SearchRequest,
     scopes = Depends(require_scopes("search:read")),
     service: SearchService = Depends(get_search_service),
+    store = Depends(get_knowledge_base_store),
 ):
     claims, tenant = scopes
+    knowledge_base_ids = _resolve_knowledge_base_ids(tenant, request.knowledge_base_ids, store)
     alias_options = request.alias or AliasOptionsModel()
     requested_tracks = tuple(
         TrackOptions(name=track.name, limit=track.limit, filters=track.filters)
@@ -445,6 +492,7 @@ def search_query(
         alias_limit=alias_options.limit,
         alias_enabled=alias_options.enabled,
         debug=request.debug,
+        knowledge_base_ids=knowledge_base_ids,
     )
     execution = service.retrieve(tenant, query=request.query, options=options)
     track_counts = Counter(result.track for result in execution.results)
@@ -495,9 +543,16 @@ def generate_summary(
     request: GenerationRequest,
     scopes = Depends(require_scopes("generate:write")),
     service: GenerationService = Depends(get_generation_service),
+    store = Depends(get_knowledge_base_store),
 ):
     claims, tenant = scopes
-    response = service.summarize(tenant, query=request.query, limit=request.limit)
+    knowledge_base_ids = _resolve_knowledge_base_ids(tenant, request.knowledge_base_ids, store)
+    response = service.summarize(
+        tenant,
+        query=request.query,
+        knowledge_base_ids=knowledge_base_ids,
+        limit=request.limit,
+    )
     return GenerationResponseModel(
         summary=response.summary,
         citations=response.citations,
@@ -578,6 +633,7 @@ def _document_to_model(result: object) -> DocumentResultModel:
     chunk_models = [ChunkModel.from_record(chunk) for chunk in doc_chunks] if doc_chunks else None
     return DocumentResultModel(
         document_id=getattr(result, "document_id"),
+        knowledge_base_id=getattr(result, "knowledge_base_id", ""),
         status=status_str,
         policy=getattr(result, "policy", None),
         chunk_count=getattr(result, "chunk_count", 0),
@@ -633,6 +689,37 @@ def _analytics_item_to_model(item: FeedbackItemSnapshot) -> FeedbackItemAnalytic
         last_feedback_at=item.last_feedback_at,
         last_comment=item.last_comment,
     )
+
+
+def _knowledge_base_to_model(record) -> KnowledgeBaseModel:
+    return KnowledgeBaseModel(
+        knowledge_base_id=record.knowledge_base_id,
+        description=record.description,
+        document_count=record.document_count,
+        keywords=list(record.keywords or []),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        last_document_title=record.last_document_title,
+        last_ingested_at=record.last_ingested_at,
+    )
+
+
+def _resolve_knowledge_base_ids(tenant, requested: List[str], store) -> Tuple[str, ...]:
+    if not requested:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="knowledge_base_ids must be provided")
+    records = store.list(tenant)
+    available = {record.knowledge_base_id: record for record in records}
+    if not available:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="no knowledge bases configured for tenant")
+    if len(requested) == 1 and requested[0] == "*":
+        return tuple(available.keys())
+    resolved: List[str] = []
+    for kb_id in requested:
+        if kb_id not in available:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"knowledge base not found: {kb_id}")
+        if kb_id not in resolved:
+            resolved.append(kb_id)
+    return tuple(resolved)
 
 
 def _latency_summary_to_model(summary: Dict[str, object]) -> LatencySummaryModel:

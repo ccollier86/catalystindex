@@ -7,7 +7,9 @@ pdfminer-six>=20221105
 pillow>=10.0.0
 pypdf>=4.0.0
 python-magic>=0.4.27
-unstructured>=0.15.8
+pi-heif>=0.7.0
+pikepdf>=8.15.1
+unstructured[docx,image,pdf,pptx,xlsx]>=0.15.8
 
 [openai]
 openai>=1.13.3

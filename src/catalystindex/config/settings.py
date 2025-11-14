@@ -58,7 +58,7 @@ class AcquisitionSettings(BaseModel):
 
 
 class StorageSettings(BaseModel):
-    vector_dimension: int = 128
+    vector_dimension: int = 3072
     premium_max_k: int = 24
     economy_max_k: int = 10
     vector_backend: str = Field(default="memory", description="Vector store backend (memory or qdrant)")
@@ -76,11 +76,11 @@ class FeatureFlags(BaseModel):
 
 
 class EmbeddingsSettings(BaseModel):
-    provider: str = Field(default="hash", description="Embedding provider identifier (hash or openai)")
-    model: str | None = Field(default=None, description="Model identifier for the provider")
+    provider: str = Field(default="openai", description="Embedding provider identifier (hash or openai)")
+    model: str | None = Field(default="text-embedding-3-large", description="Model identifier for the provider")
     api_key: str | None = Field(default=None, description="API key for hosted embedding providers")
     base_url: str | None = Field(default=None, description="Override base URL for OpenAI-compatible endpoints")
-    dimension: int = Field(default=128, description="Expected embedding dimension")
+    dimension: int = Field(default=3072, description="Expected embedding dimension")
 
 
 class PolicyAdvisorSettings(BaseModel):
@@ -93,7 +93,7 @@ class PolicyAdvisorSettings(BaseModel):
 
 
 class RerankerSettings(BaseModel):
-    enabled: bool = Field(default=False, description="Enable external reranker for premium mode")
+    enabled: bool = Field(default=True, description="Enable premium reranking")
     provider: str = Field(default="embedding", description="Reranker provider (embedding, cohere, openai)")
     model: str | None = Field(default=None, description="Model identifier for the reranker provider")
     api_key: str | None = Field(default=None, description="API key used by the reranker provider")

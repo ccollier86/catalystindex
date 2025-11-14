@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -16,6 +17,7 @@ from ..parsers.registry import ParserRegistry, default_registry
 from ..policies.resolver import ChunkingPolicy
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from .ingestion import IngestionService
+from .knowledge_base import KnowledgeBaseStore
 from .policy_advisor import PolicyAdvisor, PolicyAdvice
 
 
@@ -47,6 +49,7 @@ DOCUMENT_STAGE_SEQUENCE: tuple[str, ...] = (
 class DocumentSubmission:
     document_id: str
     document_title: str
+    knowledge_base_id: str
     schema: str | None
     source_type: str
     parser_hint: str | None
@@ -58,6 +61,7 @@ class DocumentSubmission:
 @dataclass(slots=True)
 class JobDocumentResult:
     document_id: str
+    knowledge_base_id: str
     status: DocumentStatus
     policy: str | None
     chunk_count: int
@@ -181,6 +185,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             PersistedJobDocument(
                 job_id=job_id,
                 document_id=sub.document_id,
+                knowledge_base_id=sub.knowledge_base_id,
                 status=DocumentStatus.QUEUED,
                 policy=None,
                 chunk_count=0,
@@ -214,6 +219,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 INSERT INTO ingestion_job_documents (
                     job_id,
                     document_id,
+                    knowledge_base_id,
                     status,
                     policy,
                     chunk_count,
@@ -226,12 +232,13 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     chunks,
                     progress
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         job_id,
                         doc.document_id,
+                        doc.knowledge_base_id,
                         doc.status.value,
                         doc.policy,
                         doc.chunk_count,
@@ -453,6 +460,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 CREATE TABLE IF NOT EXISTS ingestion_job_documents (
                     job_id TEXT NOT NULL,
                     document_id TEXT NOT NULL,
+                    knowledge_base_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     policy TEXT,
                     chunk_count INTEGER,
@@ -469,6 +477,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 """,
             )
             self._connection.commit()
+        self._maybe_add_column("knowledge_base_id TEXT")
         self._maybe_add_column("artifact_metadata TEXT")
         self._maybe_add_column("progress TEXT")
 
@@ -544,7 +553,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
     def _load_documents(self, job_id: str) -> List[JobDocumentResult]:
         cursor = self._execute(
             """
-            SELECT document_id, status, policy, chunk_count, artifact_uri,
+            SELECT document_id, knowledge_base_id, status, policy, chunk_count, artifact_uri,
                    artifact_content_type, artifact_metadata, parser, metadata, error, chunks, progress
             FROM ingestion_job_documents
             WHERE job_id = ?
@@ -556,6 +565,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         for row in cursor.fetchall():
             (
                 document_id,
+                knowledge_base_id,
                 status,
                 policy,
                 chunk_count,
@@ -571,6 +581,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
             documents.append(
                 JobDocumentResult(
                     document_id=document_id,
+                    knowledge_base_id=knowledge_base_id or "",
                     status=DocumentStatus(status),
                     policy=policy,
                     chunk_count=chunk_count or 0,
@@ -613,7 +624,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
     def _load_document(self, job_id: str, document_id: str) -> JobDocumentResult:
         cursor = self._execute(
             """
-            SELECT status, policy, chunk_count, artifact_uri,
+            SELECT knowledge_base_id, status, policy, chunk_count, artifact_uri,
                    artifact_content_type, artifact_metadata, parser, metadata, error, chunks
             FROM ingestion_job_documents
             WHERE job_id = ? AND document_id = ?
@@ -624,6 +635,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         if row is None:
             raise KeyError(f"document {document_id} not found in job {job_id}")
         (
+            knowledge_base_id,
             status,
             policy,
             chunk_count,
@@ -637,6 +649,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         ) = row
         return JobDocumentResult(
             document_id=document_id,
+            knowledge_base_id=knowledge_base_id or "",
             status=DocumentStatus(status),
             policy=policy,
             chunk_count=chunk_count or 0,
@@ -672,6 +685,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
     def _to_result(self, document: PersistedJobDocument) -> JobDocumentResult:
         return JobDocumentResult(
             document_id=document.document_id,
+            knowledge_base_id=document.knowledge_base_id,
             status=document.status,
             policy=document.policy,
             chunk_count=document.chunk_count,
@@ -775,7 +789,10 @@ class IngestionCoordinator:
         retry_intervals: Sequence[int] | None = None,
         policy_advisor: PolicyAdvisor | None = None,
         parser_registry: ParserRegistry | None = None,
+        knowledge_base_store: KnowledgeBaseStore | None = None,
     ) -> None:
+        if knowledge_base_store is None:
+            raise ValueError("knowledge_base_store is required")
         self._ingestion_service = ingestion_service
         self._acquisition = acquisition
         self._artifact_store = artifact_store
@@ -789,14 +806,17 @@ class IngestionCoordinator:
         self._parser_registry = parser_registry or default_registry()
         self._default_parser = "plain_text"
         self._logger = logging.getLogger(__name__)
+        self._knowledge_bases = knowledge_base_store
 
     def ingest_document(self, tenant: Tenant, submission: DocumentSubmission) -> IngestionJobRecord:
+        self._ensure_knowledge_bases(tenant, [submission])
         record = self._job_store.create(tenant, [submission])
         record = self._job_store.mark_document_running(record.job_id, submission.document_id)
         record = self._process_document(tenant, record.job_id, submission)
         return record
 
     def ingest_bulk(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
+        self._ensure_knowledge_bases(tenant, submissions)
         record = self._job_store.create(tenant, submissions)
         if not submissions:
             return record
@@ -820,6 +840,7 @@ class IngestionCoordinator:
         job_id: str,
         submission: DocumentSubmission,
     ) -> IngestionJobRecord:
+        self._ensure_knowledge_bases(tenant, [submission])
         record = self._job_store.mark_document_running(job_id, submission.document_id)
         record = self._process_document(tenant, job_id, submission)
         return record
@@ -834,6 +855,54 @@ class IngestionCoordinator:
     @property
     def retry_intervals(self) -> Sequence[int]:
         return self._retry_intervals
+
+    def _ensure_knowledge_bases(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> None:
+        for submission in submissions:
+            kb_id = (submission.knowledge_base_id or "").strip()
+            if not kb_id:
+                raise ValueError("knowledge_base_id is required for ingestion submissions")
+            metadata = submission.metadata or {}
+            description = metadata.get("knowledge_base_description")
+            description_text = description if isinstance(description, str) else None
+            keywords_value = metadata.get("knowledge_base_keywords")
+            keywords: List[str] | None = None
+            if isinstance(keywords_value, (list, tuple, set)):
+                keywords = [str(value) for value in keywords_value if value]
+            self._knowledge_bases.ensure(
+                tenant,
+                kb_id,
+                description=description_text,
+                keywords=keywords,
+            )
+
+    def _select_parser(
+        self,
+        submission: DocumentSubmission,
+        advisor_parser_hint: str | None,
+        acquisition_parser_hint: str | None,
+        content_type: str | None,
+    ) -> tuple[str, str]:
+        candidates = [
+            ("submission", submission.parser_hint),
+            ("advisor", advisor_parser_hint),
+            ("acquisition", acquisition_parser_hint),
+            ("mime", self._infer_parser_from_content_type(content_type)),
+            ("default", self._default_parser),
+        ]
+        for source, parser_name in candidates:
+            if parser_name:
+                if source not in {"submission", "advisor"}:
+                    self._logger.warning(
+                        "parser.selection.fallback",
+                        extra={
+                            "document_id": submission.document_id,
+                            "knowledge_base_id": submission.knowledge_base_id,
+                            "source": source,
+                            "parser": parser_name,
+                        },
+                    )
+                return parser_name, source
+        return self._default_parser, "default"
 
     def _process_document(
         self,
@@ -927,18 +996,19 @@ class IngestionCoordinator:
         if advisor_overrides:
             policy = _apply_policy_overrides(policy, advisor_overrides)
             advisor_metadata.setdefault("advisor_policy_overrides", advisor_overrides)
-        parser_name = (
-            submission.parser_hint
-            or advisor_parser_hint
-            or acquisition.parser_hint
-            or self._infer_parser_from_content_type(acquisition.content_type)
-            or self._default_parser
+        parser_name, parser_source = self._select_parser(
+            submission,
+            advisor_parser_hint,
+            acquisition.parser_hint,
+            acquisition.content_type,
         )
         document_metadata = {
             **acquisition.metadata,
             **submission.metadata,
             "artifact_uri": artifact.uri,
             "source_type": submission.source_type,
+            "knowledge_base_id": submission.knowledge_base_id,
+            "parser_source": parser_source,
         }
         if advisor_policy:
             document_metadata["advisor_policy"] = advisor_policy
@@ -971,6 +1041,20 @@ class IngestionCoordinator:
             chunks=ingestion_result.chunks,
             embeddings=ingestion_result.embeddings,
         )
+        keywords = self._collect_keywords(ingestion_result.chunks)
+        try:
+            self._knowledge_bases.record_document_ingested(
+                tenant,
+                submission.knowledge_base_id,
+                document_title=submission.document_title,
+                keywords=keywords,
+            )
+        except Exception:  # pragma: no cover - catalog updates must not break ingestion
+            self._logger.warning(
+                "knowledge_base.update_failed",
+                extra={"knowledge_base_id": submission.knowledge_base_id, "document_id": submission.document_id},
+                exc_info=True,
+            )
         self._audit_logger.ingest_completed(
             tenant,
             document_id=submission.document_id,
@@ -981,6 +1065,7 @@ class IngestionCoordinator:
         )
         return JobDocumentResult(
             document_id=submission.document_id,
+            knowledge_base_id=submission.knowledge_base_id,
             status=DocumentStatus.SUCCEEDED,
             policy=ingestion_result.policy.policy_name,
             chunk_count=len(ingestion_result.chunks),
@@ -1033,6 +1118,21 @@ class IngestionCoordinator:
                 extra={"job_id": job_id, "document_id": document_id, "stage": stage, "status": status},
                 exc_info=True,
             )
+
+    def _collect_keywords(self, chunks: Sequence[ChunkRecord], limit: int = 50) -> List[str]:
+        counter: Counter[str] = Counter()
+        canonical: Dict[str, str] = {}
+        for chunk in chunks:
+            for term in chunk.key_terms:
+                if not term:
+                    continue
+                normalized = term.strip()
+                if not normalized:
+                    continue
+                lowered = normalized.lower()
+                counter[lowered] += 1
+                canonical.setdefault(lowered, normalized)
+        return [canonical[key] for key, _ in counter.most_common(limit)]
 
     def _infer_parser_from_content_type(self, content_type: str | None) -> str | None:
         if not content_type:

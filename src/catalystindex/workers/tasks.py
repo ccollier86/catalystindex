@@ -37,6 +37,7 @@ def _build_submission(payload: Dict[str, object]) -> DocumentSubmission:
     return DocumentSubmission(
         document_id=payload["document_id"],
         document_title=payload.get("document_title", payload["document_id"]),
+        knowledge_base_id=payload["knowledge_base_id"],
         schema=payload.get("schema"),
         source_type=payload.get("source_type", "inline"),
         parser_hint=payload.get("parser_hint"),
