@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock
@@ -12,6 +12,8 @@ from uuid import uuid4
 from ..acquisition.service import AcquisitionService
 from ..artifacts.store import ArtifactStore
 from ..models.common import ChunkRecord, Tenant
+from ..parsers.registry import ParserRegistry, default_registry
+from ..policies.resolver import ChunkingPolicy
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from .ingestion import IngestionService
 from .policy_advisor import PolicyAdvisor, PolicyAdvice
@@ -30,6 +32,15 @@ class DocumentStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+DOCUMENT_STAGE_SEQUENCE: tuple[str, ...] = (
+    "acquired",
+    "parsed",
+    "chunked",
+    "embedded",
+    "uploaded",
+)
 
 
 @dataclass(slots=True)
@@ -57,11 +68,23 @@ class JobDocumentResult:
     metadata: Dict[str, object]
     error: str | None = None
     chunks: Sequence[ChunkRecord] = field(default_factory=tuple)
+    progress: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class PersistedJobDocument(JobDocumentResult):
     job_id: str | None = None
+
+
+def _initial_progress() -> Dict[str, Dict[str, object]]:
+    return {
+        stage: {
+            "status": "pending",
+            "updated_at": None,
+            "details": None,
+        }
+        for stage in DOCUMENT_STAGE_SEQUENCE
+    }
 
 
 @dataclass(slots=True)
@@ -102,6 +125,16 @@ class IngestionJobStore:
         raise NotImplementedError
 
     def list(self, tenant: Tenant) -> List[IngestionJobRecord]:
+        raise NotImplementedError
+
+    def update_progress(
+        self,
+        job_id: str,
+        document_id: str,
+        stage: str,
+        status: str,
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
         raise NotImplementedError
 
 
@@ -158,6 +191,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 metadata=dict(sub.metadata),
                 error=None,
                 chunks=tuple(),
+                progress=_initial_progress(),
             )
             for sub in submissions
         ]
@@ -189,9 +223,10 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     parser,
                     metadata,
                     error,
-                    chunks
+                    chunks,
+                    progress
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -207,6 +242,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                         _serialize_json(doc.metadata),
                         None,
                         _serialize_json([]),
+                        _serialize_json(doc.progress),
                     )
                     for doc in documents
                 ],
@@ -351,6 +387,51 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         job_ids = [row[0] for row in cursor.fetchall()]
         return [self._load_job(job_id) for job_id in job_ids]
 
+    def update_progress(
+        self,
+        job_id: str,
+        document_id: str,
+        stage: str,
+        status: str,
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
+        normalized_stage = stage.lower()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            row = self._execute(
+                """
+                SELECT progress
+                FROM ingestion_job_documents
+                WHERE job_id = ? AND document_id = ?
+                """,
+                (job_id, document_id),
+            ).fetchone()
+            if row is None:
+                return
+            progress = _deserialize_json(row[0]) or _initial_progress()
+            entry = progress.get(normalized_stage, {"status": "pending", "updated_at": None, "details": None})
+            entry.update(
+                {
+                    "status": status,
+                    "updated_at": now_iso,
+                    "details": details,
+                }
+            )
+            progress[normalized_stage] = entry
+            self._execute(
+                """
+                UPDATE ingestion_job_documents
+                SET progress = ?
+                WHERE job_id = ? AND document_id = ?
+                """,
+                (
+                    _serialize_json(progress),
+                    job_id,
+                    document_id,
+                ),
+            )
+            self._connection.commit()
+
     # -- internal helpers ----------------------------------------------
 
     def _ensure_schema(self) -> None:
@@ -382,13 +463,18 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     metadata TEXT,
                     error TEXT,
                     chunks TEXT,
+                    progress TEXT,
                     PRIMARY KEY (job_id, document_id)
                 )
                 """,
             )
             self._connection.commit()
+        self._maybe_add_column("artifact_metadata TEXT")
+        self._maybe_add_column("progress TEXT")
+
+    def _maybe_add_column(self, column_def: str) -> None:
         try:
-            self._execute("ALTER TABLE ingestion_job_documents ADD COLUMN artifact_metadata TEXT", ())
+            self._execute(f"ALTER TABLE ingestion_job_documents ADD COLUMN {column_def}", ())
             self._connection.commit()
         except Exception:  # pragma: no cover - best-effort schema upgrade
             try:
@@ -459,7 +545,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
         cursor = self._execute(
             """
             SELECT document_id, status, policy, chunk_count, artifact_uri,
-                   artifact_content_type, artifact_metadata, parser, metadata, error, chunks
+                   artifact_content_type, artifact_metadata, parser, metadata, error, chunks, progress
             FROM ingestion_job_documents
             WHERE job_id = ?
             ORDER BY document_id
@@ -480,6 +566,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                 metadata,
                 error,
                 chunks,
+                progress,
             ) = row
             documents.append(
                 JobDocumentResult(
@@ -494,6 +581,7 @@ class RedisPostgresIngestionJobStore(IngestionJobStore):
                     metadata=_deserialize_json(metadata),
                     error=error,
                     chunks=_deserialize_chunks(chunks),
+                    progress=_deserialize_json(progress) or _initial_progress(),
                 )
             )
         return documents
@@ -686,6 +774,7 @@ class IngestionCoordinator:
         task_dispatcher: IngestionTaskDispatcher | None = None,
         retry_intervals: Sequence[int] | None = None,
         policy_advisor: PolicyAdvisor | None = None,
+        parser_registry: ParserRegistry | None = None,
     ) -> None:
         self._ingestion_service = ingestion_service
         self._acquisition = acquisition
@@ -697,6 +786,9 @@ class IngestionCoordinator:
         self._task_dispatcher = task_dispatcher
         self._retry_intervals = tuple(retry_intervals or (15, 30, 60, 120))
         self._policy_advisor = policy_advisor
+        self._parser_registry = parser_registry or default_registry()
+        self._default_parser = "plain_text"
+        self._logger = logging.getLogger(__name__)
 
     def ingest_document(self, tenant: Tenant, submission: DocumentSubmission) -> IngestionJobRecord:
         record = self._job_store.create(tenant, [submission])
@@ -781,7 +873,24 @@ class IngestionCoordinator:
             )
         except Exception:
             self._metrics.record_dependency_failure("acquisition")
+            self._record_stage(
+                job_id,
+                submission.document_id,
+                "acquired",
+                "failed",
+                {"error": "acquisition_failed"},
+            )
             raise
+        self._record_stage(
+            job_id,
+            submission.document_id,
+            "acquired",
+            "succeeded",
+            {
+                "content_type": acquisition.content_type,
+                "parser_hint": acquisition.parser_hint,
+            },
+        )
         artifact = self._artifact_store.store_document(
             tenant,
             job_id=job_id,
@@ -791,6 +900,8 @@ class IngestionCoordinator:
             metadata=acquisition.metadata,
         )
         advisor_policy = None
+        advisor_parser_hint = None
+        advisor_overrides: Dict[str, object] = {}
         advisor_metadata: Dict[str, object] = {}
         if self._policy_advisor and not submission.schema:
             preview = self._preview_text(acquisition.content)
@@ -807,9 +918,22 @@ class IngestionCoordinator:
                 advisor_metadata["advisor_notes"] = advice.notes
             if advice.tags:
                 advisor_metadata["advisor_tags"] = advice.tags
+            if advice.parser_hint:
+                advisor_parser_hint = advice.parser_hint
+            if advice.chunk_overrides:
+                advisor_overrides = advice.chunk_overrides
         policy_hint = submission.schema or advisor_policy
-        policy = self._resolve_policy(submission.document_title, policy_hint)
-        parser_name = submission.parser_hint or acquisition.parser_hint or "plain_text"
+        policy = self._resolve_policy(policy_hint)
+        if advisor_overrides:
+            policy = _apply_policy_overrides(policy, advisor_overrides)
+            advisor_metadata.setdefault("advisor_policy_overrides", advisor_overrides)
+        parser_name = (
+            submission.parser_hint
+            or advisor_parser_hint
+            or acquisition.parser_hint
+            or self._infer_parser_from_content_type(acquisition.content_type)
+            or self._default_parser
+        )
         document_metadata = {
             **acquisition.metadata,
             **submission.metadata,
@@ -821,6 +945,8 @@ class IngestionCoordinator:
         document_metadata.update(advisor_metadata)
         if acquisition.content_type and "content_type" not in document_metadata:
             document_metadata["content_type"] = acquisition.content_type
+        if advisor_parser_hint:
+            document_metadata.setdefault("advisor_parser", advisor_parser_hint)
         ingestion_result = self._ingestion_service.ingest(
             tenant=tenant,
             document_id=submission.document_id,
@@ -829,6 +955,21 @@ class IngestionCoordinator:
             policy=policy,
             parser_name=parser_name,
             document_metadata=document_metadata,
+            progress_callback=lambda stage, status, info: self._record_stage(
+                job_id,
+                submission.document_id,
+                stage,
+                status,
+                info,
+            ),
+        )
+        self._persist_pipeline_artifacts(
+            tenant,
+            job_id,
+            submission.document_id,
+            policy=ingestion_result.policy,
+            chunks=ingestion_result.chunks,
+            embeddings=ingestion_result.embeddings,
         )
         self._audit_logger.ingest_completed(
             tenant,
@@ -876,6 +1017,86 @@ class IngestionCoordinator:
             text = content
         return text[:limit]
 
+    def _record_stage(
+        self,
+        job_id: str,
+        document_id: str,
+        stage: str,
+        status: str,
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
+        try:
+            self._job_store.update_progress(job_id, document_id, stage, status, details)
+        except Exception:  # pragma: no cover - best effort
+            self._logger.debug(
+                "progress.update_failed",
+                extra={"job_id": job_id, "document_id": document_id, "stage": stage, "status": status},
+                exc_info=True,
+            )
+
+    def _infer_parser_from_content_type(self, content_type: str | None) -> str | None:
+        if not content_type:
+            return None
+        mime = content_type.split(";")[0].strip().lower()
+        if not mime:
+            return None
+        if "pdf" in mime:
+            return "pdf"
+        if "word" in mime or "msword" in mime:
+            return "docx"
+        if "powerpoint" in mime or "presentation" in mime:
+            return "pptx"
+        if "excel" in mime or "spreadsheet" in mime:
+            return "xlsx"
+        for name, metadata in self._parser_registry.list_parsers().items():
+            if not metadata:
+                continue
+            normalized = {value.lower() for value in metadata.content_types}
+            if mime in normalized:
+                return name
+        if "pdf" in mime:
+            return "pdf"
+        if "html" in mime:
+            return "html"
+        return None
+
+    def _persist_pipeline_artifacts(
+        self,
+        tenant: Tenant,
+        job_id: str,
+        document_id: str,
+        *,
+        policy: ChunkingPolicy,
+        chunks: Sequence[ChunkRecord],
+        embeddings: Sequence[Sequence[float]],
+    ) -> None:
+        payloads: Dict[str, object] = {
+            "policy": _policy_to_dict(policy),
+            "chunks": _serialize_chunk_records(chunks),
+            "embeddings": _serialize_embeddings(chunks, embeddings),
+            "term_index": _build_term_index_snapshot(chunks),
+        }
+        if len(embeddings) != len(chunks):  # pragma: no cover - diagnostic guard
+            self._logger.warning(
+                "artifact_store.embedding_mismatch",
+                extra={"document_id": document_id, "chunk_count": len(chunks), "embedding_count": len(embeddings)},
+            )
+        for name, payload in payloads.items():
+            try:
+                self._artifact_store.store_json_artifact(
+                    tenant,
+                    job_id=job_id,
+                    document_id=document_id,
+                    name=name,
+                    payload=payload,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                self._logger.warning(
+                    "artifact_store.persist_failed",
+                    extra={"document_id": document_id, "artifact": name},
+                    exc_info=True,
+                )
+
 
 __all__ = [
     "DocumentStatus",
@@ -888,3 +1109,84 @@ __all__ = [
     "JobDocumentResult",
     "RedisPostgresIngestionJobStore",
 ]
+
+
+def _policy_to_dict(policy: ChunkingPolicy) -> Dict[str, object]:
+    return {
+        "policy_name": policy.policy_name,
+        "chunk_modes": list(policy.chunk_modes),
+        "window_size": policy.window_size,
+        "window_overlap": policy.window_overlap,
+        "max_chunk_tokens": policy.max_chunk_tokens,
+        "chunk_tiers": list(policy.chunk_tiers),
+        "highlight_phrases": list(policy.highlight_phrases),
+        "required_metadata": list(policy.required_metadata),
+        "llm_metadata": {
+            "enabled": policy.llm_metadata.enabled,
+            "model": policy.llm_metadata.model,
+            "summary_length": policy.llm_metadata.summary_length,
+            "max_terms": policy.llm_metadata.max_terms,
+        },
+    }
+
+
+def _serialize_chunk_records(chunks: Sequence[ChunkRecord]) -> List[Dict[str, object]]:
+    return [
+        {
+            "chunk_id": chunk.chunk_id,
+            "section_slug": chunk.section_slug,
+            "text": chunk.text,
+            "chunk_tier": chunk.chunk_tier,
+            "start_page": chunk.start_page,
+            "end_page": chunk.end_page,
+            "bbox_pointer": chunk.bbox_pointer,
+            "summary": chunk.summary,
+            "key_terms": list(chunk.key_terms),
+            "requires_previous": chunk.requires_previous,
+            "prev_chunk_id": chunk.prev_chunk_id,
+            "confidence_note": chunk.confidence_note,
+            "metadata": dict(chunk.metadata),
+        }
+        for chunk in chunks
+    ]
+
+
+def _serialize_embeddings(
+    chunks: Sequence[ChunkRecord],
+    embeddings: Sequence[Sequence[float]],
+) -> List[Dict[str, object]]:
+    return [
+        {"chunk_id": chunk.chunk_id, "vector": [float(value) for value in vector]}
+        for chunk, vector in zip(chunks, embeddings)
+    ]
+
+
+def _build_term_index_snapshot(chunks: Sequence[ChunkRecord]) -> Dict[str, Dict[str, object]]:
+    snapshot: Dict[str, Dict[str, object]] = {}
+    for chunk in chunks:
+        snapshot[chunk.chunk_id] = {
+            "aliases": list(chunk.key_terms),
+            "section_slug": chunk.section_slug,
+            "chunk_tier": chunk.chunk_tier,
+        }
+    return snapshot
+
+
+def _apply_policy_overrides(policy: ChunkingPolicy, overrides: Dict[str, object]) -> ChunkingPolicy:
+    updates: Dict[str, object] = {}
+    if "chunk_modes" in overrides:
+        try:
+            updates["chunk_modes"] = tuple(overrides["chunk_modes"])
+        except TypeError:
+            pass
+    if "chunk_tiers" in overrides:
+        try:
+            updates["chunk_tiers"] = tuple(overrides["chunk_tiers"])
+        except TypeError:
+            pass
+    for key in ("window_size", "window_overlap", "max_chunk_tokens"):
+        if key in overrides and isinstance(overrides[key], int):
+            updates[key] = overrides[key]
+    if not updates:
+        return policy
+    return replace(policy, **updates)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 
@@ -59,23 +59,11 @@ POLICY_OVERRIDES: Dict[str, ChunkingPolicy] = {
 }
 
 
-def resolve_policy(document_title: str, schema_name: str | None) -> ChunkingPolicy:
-    """Resolve chunking policy using schema override or heuristics."""
+def resolve_policy(policy_name: str | None) -> ChunkingPolicy:
+    """Resolve chunking policy using explicit advisor/schema selection."""
 
-    if schema_name and schema_name in POLICY_OVERRIDES:
-        return POLICY_OVERRIDES[schema_name]
-
-    lower_title = document_title.lower()
-    if "criteria" in lower_title or "diagnosis" in lower_title:
-        return POLICY_OVERRIDES["dsm5"]
-    if "treatment" in lower_title or "plan" in lower_title:
-        return POLICY_OVERRIDES["treatment_planner"]
-    if "summary" in lower_title or "overview" in lower_title:
-        return replace(
-            DEFAULT_POLICY,
-            chunk_modes=("semantic", "highlight"),
-            llm_metadata=LLMMetadataConfig(enabled=True, model="gpt-4o-mini", summary_length=180, max_terms=5),
-        )
+    if policy_name and policy_name in POLICY_OVERRIDES:
+        return POLICY_OVERRIDES[policy_name]
 
     return DEFAULT_POLICY
 

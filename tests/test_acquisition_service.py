@@ -67,3 +67,31 @@ def test_ingestion_pipeline_with_url_fetch(tmp_path):
     )
     assert record.chunks, "URL ingestion should produce chunks"
     assert record.chunks[0].metadata.get("firecrawl") is True
+
+
+def test_inline_upload_infers_content_type_and_parser():
+    service = AcquisitionService()
+    result = service.acquire(
+        source_type="inline",
+        content=b"%PDF-1.4 example",
+        content_uri=None,
+        metadata={"filename": "policy.pdf"},
+    )
+    assert result.content_type == "application/pdf"
+    assert result.parser_hint == "pdf"
+
+
+def test_url_detection_uses_source_hint():
+    result = AcquisitionResult(
+        content=b"%PDF-1.5 sample",
+        content_type=None,
+        source_uri=None,
+        parser_hint=None,
+        metadata={}
+    )
+    service = AcquisitionService(url_fetcher=FakeFetcher(result=result))
+
+    acquired = service.acquire(source_type="url", content=None, content_uri="https://example.com/manual.pdf")
+
+    assert acquired.content_type == "application/pdf"
+    assert acquired.parser_hint == "pdf"

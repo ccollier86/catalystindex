@@ -29,6 +29,13 @@ workers = [
     "redis>=5.0.0",
     "psycopg[binary]>=3.1.12",
 ]
+ingestion = [
+    "pdfminer-six>=20221105",
+    "pillow>=10.0.0",
+    "pypdf>=4.0.0",
+    "python-magic>=0.4.27",
+    "unstructured>=0.15.8",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -279,6 +279,7 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         task_dispatcher=get_ingestion_task_dispatcher(),
         retry_intervals=settings.jobs.worker.retry_intervals,
         policy_advisor=get_policy_advisor(),
+        parser_registry=get_parser_registry(),
     )
 
 

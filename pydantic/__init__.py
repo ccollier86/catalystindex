@@ -54,6 +54,9 @@ class BaseModel(metaclass=BaseModelMeta):
                     value = info.default
             else:
                 value = getattr(self.__class__, field, None)
+            annotation = annotations.get(field)
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel) and isinstance(value, dict):
+                value = annotation(**value)
             setattr(self, field, value)
 
     def model_dump(self) -> Dict[str, Any]:
@@ -71,6 +74,12 @@ class BaseModel(metaclass=BaseModelMeta):
 
     def dict(self) -> Dict[str, Any]:
         return self.model_dump()
+
+    def model_copy(self, *, update: Dict[str, Any] | None = None):
+        data = self.model_dump()
+        if update:
+            data.update(update)
+        return self.__class__(**data)
 
 
 __all__ = ["BaseModel", "Field"]

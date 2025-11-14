@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import typing
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
@@ -74,6 +75,45 @@ class FastAPI(APIRouter):
                 return route
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Route {method} {path} not found")
 
+    async def __call__(self, scope, receive, send):  # pragma: no cover - exercised via real server
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] != "http":
+            raise RuntimeError("Unsupported scope type")
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        method = scope["method"].upper()
+        path = scope["path"]
+        try:
+            route = self.find_route(method, path)
+            json_body = json.loads(body.decode("utf-8")) if body else {}
+            headers = {key.decode("latin1").lower(): value.decode("latin1") for key, value in scope.get("headers", [])}
+            payload = _call_with_dependencies(route.endpoint, json_body=json_body, headers=headers)
+            response_data = _serialize_response(payload)
+            status_code = status.HTTP_200_OK
+        except HTTPException as exc:
+            response_data = {"detail": exc.detail}
+            status_code = exc.status_code
+        response_body = json.dumps(response_data).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(response_body)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": response_body})
+
 
 def _call_with_dependencies(
     func: Callable[..., Any],
@@ -81,6 +121,7 @@ def _call_with_dependencies(
     json_body: Dict[str, Any],
     headers: Dict[str, str],
 ) -> Any:
+    normalized_headers = {key.lower(): value for key, value in headers.items()}
     signature = inspect.signature(func)
     type_hints = typing.get_type_hints(func)
     kwargs: Dict[str, Any] = {}
@@ -88,16 +129,16 @@ def _call_with_dependencies(
         annotation = type_hints.get(name, param.annotation)
         default = param.default
         if isinstance(default, Depends):
-            kwargs[name] = _resolve_dependency(default.dependency, headers=headers)
+            kwargs[name] = _resolve_dependency(default.dependency, headers=normalized_headers)
         elif isinstance(default, Header):
-            alias = default.alias or name
-            if alias not in headers:
+            alias = (default.alias or name).lower()
+            if alias not in normalized_headers:
                 if default.default is not None:
                     kwargs[name] = default.default
                 else:
                     raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Missing header '{alias}'")
             else:
-                kwargs[name] = headers[alias]
+                kwargs[name] = normalized_headers[alias]
         elif annotation is not inspect._empty and isinstance(annotation, type) and issubclass(annotation, BaseModel):
             kwargs[name] = annotation(**json_body)
         else:
@@ -111,22 +152,23 @@ def _call_with_dependencies(
 
 
 def _resolve_dependency(func: Callable[..., Any], *, headers: Dict[str, str]) -> Any:
+    normalized_headers = {key.lower(): value for key, value in headers.items()}
     signature = inspect.signature(func)
     type_hints = typing.get_type_hints(func)
     kwargs: Dict[str, Any] = {}
     for name, param in signature.parameters.items():
         default = param.default
         if isinstance(default, Depends):
-            kwargs[name] = _resolve_dependency(default.dependency, headers=headers)
+            kwargs[name] = _resolve_dependency(default.dependency, headers=normalized_headers)
         elif isinstance(default, Header):
-            alias = default.alias or name
-            if alias not in headers:
+            alias = (default.alias or name).lower()
+            if alias not in normalized_headers:
                 if default.default is not None:
                     kwargs[name] = default.default
                 else:
                     raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Missing header '{alias}'")
             else:
-                kwargs[name] = headers[alias]
+                kwargs[name] = normalized_headers[alias]
         else:
             if default is not inspect._empty:
                 kwargs[name] = default

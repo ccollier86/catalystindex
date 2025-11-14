@@ -13,7 +13,13 @@ class ParserAdapter(ABC):
     """Base class for document parsers."""
 
     @abstractmethod
-    def parse(self, content: bytes | str, *, document_title: str) -> Iterable[SectionText]:
+    def parse(
+        self,
+        content: bytes | str,
+        *,
+        document_title: str,
+        content_type: str | None = None,
+    ) -> Iterable[SectionText]:
         raise NotImplementedError
 
 
@@ -30,7 +36,13 @@ class ParserMetadata:
 class PlainTextParser(ParserAdapter):
     """Simple parser for plain text content."""
 
-    def parse(self, content: bytes | str, *, document_title: str) -> Iterable[SectionText]:
+    def parse(
+        self,
+        content: bytes | str,
+        *,
+        document_title: str,
+        content_type: str | None = None,
+    ) -> Iterable[SectionText]:
         text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
         yield SectionText(
             section_slug="body",
@@ -43,7 +55,13 @@ class PlainTextParser(ParserAdapter):
 class HTMLParserAdapter(ParserAdapter):
     """HTML parser that sanitises markup using a lightweight stripper."""
 
-    def parse(self, content: bytes | str, *, document_title: str) -> Iterable[SectionText]:
+    def parse(
+        self,
+        content: bytes | str,
+        *,
+        document_title: str,
+        content_type: str | None = None,
+    ) -> Iterable[SectionText]:
         html = content.decode("utf-8") if isinstance(content, bytes) else str(content)
         sanitizer = _HTMLSanitizer()
         sanitizer.feed(html)
@@ -63,7 +81,13 @@ class HTMLParserAdapter(ParserAdapter):
 class PDFParserStub(ParserAdapter):
     """Parser stub capturing PDF artifact references for downstream processing."""
 
-    def parse(self, content: bytes | str, *, document_title: str) -> Iterable[SectionText]:
+    def parse(
+        self,
+        content: bytes | str,
+        *,
+        document_title: str,
+        content_type: str | None = None,
+    ) -> Iterable[SectionText]:
         artifact_pointer = content if isinstance(content, str) else "inline-pdf"
         yield SectionText(
             section_slug="pdf_artifact",
@@ -80,7 +104,13 @@ class PDFParserStub(ParserAdapter):
 class OCRParserStub(ParserAdapter):
     """Parser stub for OCR inputs, capturing the raw artifact pointer."""
 
-    def parse(self, content: bytes | str, *, document_title: str) -> Iterable[SectionText]:
+    def parse(
+        self,
+        content: bytes | str,
+        *,
+        document_title: str,
+        content_type: str | None = None,
+    ) -> Iterable[SectionText]:
         artifact_pointer = content if isinstance(content, str) else "inline-ocr"
         yield SectionText(
             section_slug="ocr_artifact",

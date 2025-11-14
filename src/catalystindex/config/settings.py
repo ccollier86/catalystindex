@@ -143,7 +143,7 @@ def get_settings() -> AppSettings:
     overrides = _load_env_overrides()
     if not overrides:
         return base
-    return base.model_copy(update=overrides)
+    return AppSettings(**overrides)
 
 
 def _load_env_overrides(prefix: str = "CATALYST_") -> dict:

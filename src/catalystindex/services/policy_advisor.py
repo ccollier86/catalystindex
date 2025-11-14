@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 try:  # pragma: no cover - optional dependency import guard
@@ -16,6 +16,8 @@ class PolicyAdvice:
     confidence: Optional[float]
     tags: Dict[str, str]
     notes: Optional[str]
+    parser_hint: Optional[str] = None
+    chunk_overrides: Dict[str, object] = field(default_factory=dict)
 
 
 class PolicyAdvisor:
@@ -51,13 +53,14 @@ class PolicyAdvisor:
         if not self.enabled:
             return PolicyAdvice(policy_name=None, confidence=None, tags={}, notes=None)
         prompt = (
-            "You are assisting a retrieval system by labeling documents with the best ingestion recipe. "
+            "You are assisting a retrieval system by labeling documents with the best ingestion recipe and parser. "
             "Known recipes: dsm5, treatment_planner, summary, general. If none match, return 'general'.\n"
             f"Title: {title}\n"
             f"Provided schema hint: {schema or 'none'}\n"
             "Document preview:\n"
             f"{content[: self._sample_chars]}\n"
-            "Respond strictly in JSON with fields policy_name, confidence (0-1), tags (object), notes."
+            "Respond strictly in JSON with fields: policy_name, parser_hint, confidence (0-1), tags (object), notes, chunk_overrides (object)."
+            "chunk_overrides may include keys chunk_modes (list), window_size, window_overlap, max_chunk_tokens."
         )
         response = self._client.responses.create(  # type: ignore[union-attr]
             model=self._model,
@@ -68,11 +71,15 @@ class PolicyAdvisor:
             data = json.loads(text)
         except json.JSONDecodeError:
             return PolicyAdvice(policy_name=None, confidence=None, tags={}, notes=text)
+        overrides = data.get("chunk_overrides")
+        overrides_dict = overrides if isinstance(overrides, dict) else {}
         return PolicyAdvice(
             policy_name=data.get("policy_name"),
             confidence=data.get("confidence"),
             tags={k: str(v) for k, v in (data.get("tags", {}) or {}).items()},
             notes=data.get("notes"),
+            parser_hint=data.get("parser_hint"),
+            chunk_overrides=overrides_dict,
         )
 
 

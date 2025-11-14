@@ -74,6 +74,7 @@ class DocumentResultModel(BaseModel):
     metadata: dict = Field(default_factory=dict)
     error: str | None = None
     chunks: List[ChunkModel] | None = None
+    progress: dict = Field(default_factory=dict)
 
 
 class IngestResponse(BaseModel):
@@ -585,6 +586,7 @@ def _document_to_model(result: object) -> DocumentResultModel:
         metadata=metadata,
         error=getattr(result, "error", None),
         chunks=chunk_models,
+        progress=dict(getattr(result, "progress", {}) or {}),
     )
 
 

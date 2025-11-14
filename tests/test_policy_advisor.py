@@ -3,12 +3,13 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from catalystindex.models.common import Tenant
+from catalystindex.models.common import SectionText, Tenant
 from catalystindex.services.ingestion import IngestionService
 from catalystindex.services.ingestion_jobs import DocumentSubmission, IngestionCoordinator, RedisPostgresIngestionJobStore
 from catalystindex.services.policy_advisor import PolicyAdvice
 from catalystindex.chunking.engine import ChunkingEngine
 from catalystindex.embeddings.hash import HashEmbeddingProvider
+from catalystindex.parsers.base import ParserAdapter, ParserMetadata
 from catalystindex.parsers.registry import default_registry
 from catalystindex.policies.resolver import resolve_policy
 from catalystindex.artifacts.store import InMemoryArtifactStore
@@ -52,6 +53,7 @@ def test_policy_advisor_influences_policy_selection():
         audit_logger=AuditLogger(),
         policy_resolver=resolve_policy,
         policy_advisor=StubAdvisor(PolicyAdvice(policy_name="treatment_planner", confidence=0.9, tags={"doc_type": "treatment"}, notes=None)),
+        parser_registry=default_registry(),
     )
     tenant = Tenant(org_id="org", workspace_id="ws", user_id="u1")
     submission = DocumentSubmission(
@@ -69,3 +71,68 @@ def test_policy_advisor_influences_policy_selection():
     assert document.policy == "treatment_planner"
     assert document.metadata.get("advisor_policy") == "treatment_planner"
     assert document.metadata.get("advisor_tags") == {"doc_type": "treatment"}
+
+
+def test_policy_advisor_sets_parser_and_overrides():
+    registry = default_registry()
+
+    class DummyPDFParser(ParserAdapter):
+        def parse(self, content, *, document_title: str, content_type: str | None = None):  # pragma: no cover - simple stub
+            text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+            yield SectionText(section_slug="body", title=document_title, text=text)
+
+    registry.register(
+        "pdf",
+        DummyPDFParser(),
+        metadata=ParserMetadata(name="pdf", content_types=("application/pdf",), description="dummy pdf"),
+    )
+
+    ingestion = IngestionService(
+        parser_registry=registry,
+        chunking_engine=ChunkingEngine(namespace="advisor-test"),
+        embedding_provider=HashEmbeddingProvider(dimension=32),
+        vector_store=InMemoryVectorStore(),
+        term_index=InMemoryTermIndex(),
+        audit_logger=AuditLogger(),
+        metrics=MetricsRecorder(),
+    )
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    job_store = RedisPostgresIngestionJobStore(connection=connection)
+    advisor = StubAdvisor(
+        PolicyAdvice(
+            policy_name="dsm5",
+            confidence=0.7,
+            tags={},
+            notes=None,
+            parser_hint="pdf",
+            chunk_overrides={"chunk_modes": ["window"], "window_overlap": 40},
+        )
+    )
+    coordinator = IngestionCoordinator(
+        ingestion_service=ingestion,
+        acquisition=AcquisitionService(),
+        artifact_store=InMemoryArtifactStore(),
+        job_store=job_store,
+        metrics=MetricsRecorder(),
+        audit_logger=AuditLogger(),
+        policy_resolver=resolve_policy,
+        policy_advisor=advisor,
+        parser_registry=registry,
+    )
+    tenant = Tenant(org_id="org", workspace_id="ws", user_id="u1")
+    submission = DocumentSubmission(
+        document_id="doc-advisor-parser",
+        document_title="Unknown PDF",
+        schema=None,
+        source_type="inline",
+        parser_hint=None,
+        metadata={"content_type": "application/pdf"},
+        content="Criterion A text",
+        content_uri=None,
+    )
+    job = coordinator.ingest_document(tenant, submission)
+    document = job.documents[0]
+    assert document.parser == "pdf"
+    assert document.metadata.get("advisor_parser") == "pdf"
+    assert document.metadata.get("advisor_policy_overrides") == {"chunk_modes": ["window"], "window_overlap": 40}

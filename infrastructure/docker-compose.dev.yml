@@ -1,11 +1,55 @@
 version: "3.9"
 
 services:
+  api:
+    build:
+      context: ..
+    env_file:
+      - ../.env
+    environment:
+      CATALYST_STORAGE__qdrant__host: qdrant
+      CATALYST_STORAGE__qdrant__sparse_vectors: "false"
+      CATALYST_STORAGE__vector_backend: memory
+      CATALYST_STORAGE__redis__url: redis://redis:6379/0
+      CATALYST_JOBS__store__redis_url: redis://redis:6379/1
+      CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
+      CATALYST_EMBEDDINGS__provider: hash
+      CATALYST_RERANKER__enabled: "false"
+      CATALYST_POLICY_ADVISOR__enabled: "false"
+    ports:
+      - "18888:8000"
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+
+  worker:
+    build:
+      context: ..
+    command: ["python", "scripts/run_worker.py"]
+    env_file:
+      - ../.env
+    environment:
+      CATALYST_STORAGE__qdrant__host: qdrant
+      CATALYST_STORAGE__qdrant__sparse_vectors: "false"
+      CATALYST_STORAGE__vector_backend: memory
+      CATALYST_STORAGE__redis__url: redis://redis:6379/0
+      CATALYST_JOBS__store__redis_url: redis://redis:6379/1
+      CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
+      CATALYST_JOBS__worker__queue_name: ingestion
+      CATALYST_EMBEDDINGS__provider: hash
+      CATALYST_RERANKER__enabled: "false"
+      CATALYST_POLICY_ADVISOR__enabled: "false"
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+
   postgres:
     image: postgres:15
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: catalyst
       POSTGRES_PASSWORD: catalyst

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Sequence
+from typing import Callable, Dict, Iterable, List, Sequence
 
 from time import perf_counter
 
@@ -22,6 +22,7 @@ class IngestionResult:
     document_id: str
     policy: ChunkingPolicy
     chunks: Sequence[ChunkRecord]
+    embeddings: Sequence[Sequence[float]]
 
 
 class IngestionService:
@@ -58,11 +59,32 @@ class IngestionService:
         policy: ChunkingPolicy,
         parser_name: str | None = None,
         document_metadata: Dict[str, object] | None = None,
+        progress_callback: Callable[[str, str, Dict[str, object]], None] | None = None,
     ) -> IngestionResult:
+        def emit(stage: str, status: str, details: Dict[str, object] | None = None) -> None:
+            if progress_callback:
+                progress_callback(stage, status, details or {})
+
         start = perf_counter()
         parser = self._parser_registry.resolve(parser_name or self._default_parser)
-        sections: Iterable[SectionText] = parser.parse(content, document_title=document_title)
-        chunks = [
+        content_type = None
+        if document_metadata and isinstance(document_metadata.get("content_type"), str):
+            content_type = document_metadata.get("content_type")
+        emit("parsed", "running", {"parser": parser.__class__.__name__})
+        try:
+            sections_iter: Iterable[SectionText] = parser.parse(
+                content,
+                document_title=document_title,
+                content_type=content_type,
+            )
+            sections = list(sections_iter)
+        except Exception as exc:
+            emit("parsed", "failed", {"error": str(exc)})
+            raise
+        emit("parsed", "succeeded", {"sections": len(sections)})
+        emit("chunked", "running", {"policy": policy.policy_name})
+        try:
+            chunks = [
             self._enrich_chunk(
                 tenant,
                 document_id,
@@ -72,15 +94,40 @@ class IngestionService:
             )
             for chunk in self._chunking_engine.generate_chunks(sections, policy, document_id)
         ]
-        embeddings = self._embed_chunks(chunks)
+        except Exception as exc:
+            emit("chunked", "failed", {"error": str(exc)})
+            raise
+        emit("chunked", "succeeded", {"chunks": len(chunks)})
+        emit(
+            "embedded",
+            "running",
+            {"provider": type(self._embedding_provider).__name__},
+        )
+        try:
+            embeddings = tuple(self._embed_chunks(chunks))
+        except Exception as exc:
+            emit("embedded", "failed", {"error": str(exc)})
+            raise
+        emit("embedded", "succeeded", {"count": len(embeddings)})
         documents = [
             VectorDocument(chunk=chunk, vector=embedding, track="text")
             for chunk, embedding in zip(chunks, embeddings)
         ]
-        self._vector_store.upsert(tenant, documents)
+        emit("uploaded", "running", {"documents": len(documents)})
+        try:
+            self._vector_store.upsert(tenant, documents)
+        except Exception as exc:
+            emit("uploaded", "failed", {"error": str(exc)})
+            raise
+        emit("uploaded", "succeeded", {"documents": len(documents)})
         duration_ms = (perf_counter() - start) * 1000.0
         self._metrics.record_ingestion(len(chunks), latency_ms=duration_ms)
-        return IngestionResult(document_id=document_id, policy=policy, chunks=tuple(chunks))
+        return IngestionResult(
+            document_id=document_id,
+            policy=policy,
+            chunks=tuple(chunks),
+            embeddings=embeddings,
+        )
 
     def _embed_chunks(self, chunks: Sequence[ChunkRecord]) -> Sequence[Sequence[float]]:
         missing_texts = [chunk.text for chunk in chunks if chunk.text not in self._embedding_cache]

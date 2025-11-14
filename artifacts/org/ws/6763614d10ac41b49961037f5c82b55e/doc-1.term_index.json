@@ -1,0 +1,29 @@
+{
+  "doc-1|body|1": {
+    "aliases": [
+      "criterion",
+      "exposure",
+      "trauma"
+    ],
+    "section_slug": "body",
+    "chunk_tier": "criteria"
+  },
+  "doc-1|body|2": {
+    "aliases": [
+      "criterion",
+      "intrusion"
+    ],
+    "section_slug": "body",
+    "chunk_tier": "criteria"
+  },
+  "doc-1|body|3": {
+    "aliases": [
+      "criterion",
+      "exposure",
+      "trauma",
+      "intrusion"
+    ],
+    "section_slug": "body",
+    "chunk_tier": "criteria"
+  }
+}
