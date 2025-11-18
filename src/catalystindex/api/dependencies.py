@@ -28,6 +28,8 @@ from ..services.ingestion_jobs import (
 )
 from ..services.knowledge_base import KnowledgeBaseStore
 from ..services.policy_advisor import PolicyAdvisor, PolicyAdvice
+from ..services.policy_synthesizer import LLMPolicySynthesizer, PolicySynthesizer
+from ..services.workload import WorkloadLimiter
 from ..workers.dispatcher import RQIngestionTaskDispatcher
 from ..services.search import CohereReranker, EmbeddingReranker, OpenAIReranker, SearchService
 from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
@@ -36,6 +38,12 @@ from ..telemetry.logger import AuditLogger, MetricsRecorder
 from ..chunking.engine import ChunkingEngine
 
 LOGGER = logging.getLogger("catalystindex.dependencies")
+
+# Ensure settings cache is fresh (useful when environment is reloaded in long-lived processes/tests).
+try:
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+except Exception:
+    pass
 
 
 @lru_cache
@@ -75,6 +83,7 @@ def get_vector_store() -> VectorStoreClient:
             grpc_port=qdrant_settings.grpc_port,
             api_key=qdrant_settings.api_key,
             prefer_grpc=qdrant_settings.prefer_grpc,
+            timeout=300.0,
         )
         return QdrantVectorStore(
             client,
@@ -82,6 +91,15 @@ def get_vector_store() -> VectorStoreClient:
             vector_size=settings.storage.vector_dimension,
             sparse_enabled=qdrant_settings.sparse_vectors,
             metadata_fields={"environment": settings.environment},
+            rest_base_url=f"http://{qdrant_settings.host}:{qdrant_settings.port}",
+            api_key=qdrant_settings.api_key,
+            hnsw_m=qdrant_settings.hnsw_m,
+            hnsw_m_final=qdrant_settings.hnsw_m_final,
+            indexing_threshold_kb=qdrant_settings.indexing_threshold_kb,
+            shard_number=qdrant_settings.shard_number,
+            on_disk_vectors=qdrant_settings.on_disk_vectors,
+            hnsw_on_disk=qdrant_settings.hnsw_on_disk,
+            defer_indexing=qdrant_settings.defer_indexing,
         )
     return InMemoryVectorStore()
 
@@ -114,12 +132,22 @@ def get_term_index() -> TermIndex:
 @lru_cache
 def get_embedding_provider() -> HashEmbeddingProvider:
     settings = get_settings()
+    if isinstance(settings, dict):
+        from ..config.settings import AppSettings as _AppSettings
+        settings = _AppSettings(**settings)
     embeddings_settings = settings.embeddings
+    if isinstance(embeddings_settings, dict):  # defensive for env parsing edge cases
+        from ..config.settings import EmbeddingsSettings as _EmbeddingsSettings
+        embeddings_settings = _EmbeddingsSettings(**embeddings_settings)
     provider = (embeddings_settings.provider or "openai").lower()
     if provider == "openai":
         builder = _build_openai_embedding_provider(embeddings_settings)
         if builder:
             return builder
+        if not embeddings_settings.allow_hash_fallback:
+            raise RuntimeError(
+                "OpenAI embeddings requested but no API key configured. Set CATALYST_EMBEDDINGS__allow_hash_fallback=true to enable dev-lite hash embeddings."
+            )
         LOGGER.warning(
             "embeddings.fallback",
             extra={"provider": "openai", "detail": "Falling back to hash embeddings"},
@@ -129,6 +157,8 @@ def get_embedding_provider() -> HashEmbeddingProvider:
             "embeddings.unknown_provider",
             extra={"provider": provider},
         )
+    if provider in {"hash", "dev_hash"} and not embeddings_settings.allow_hash_fallback:
+        raise RuntimeError("Hash embeddings are disabled; enable allow_hash_fallback for dev-lite mode.")
     return HashEmbeddingProvider(dimension=embeddings_settings.dimension or settings.storage.vector_dimension)
 
 
@@ -260,6 +290,7 @@ def get_ingestion_task_dispatcher() -> IngestionTaskDispatcher | None:
             default_timeout=worker_settings.default_timeout,
             max_retries=worker_settings.max_retries,
             retry_intervals=worker_settings.retry_intervals,
+            max_queue_length=worker_settings.max_queue_length,
         )
     except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency guard
         raise RuntimeError(
@@ -269,11 +300,30 @@ def get_ingestion_task_dispatcher() -> IngestionTaskDispatcher | None:
 
 
 @lru_cache
+def get_workload_limiter() -> WorkloadLimiter | None:
+    settings = get_settings()
+    max_active = settings.jobs.worker.max_active_docs
+    if max_active is None or max_active <= 0:
+        return None
+    redis_client = None
+    redis_url = settings.jobs.store.redis_url
+    if redis_url:
+        try:
+            import redis  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - optional dependency
+            redis_client = None
+        else:
+            redis_client = redis.Redis.from_url(redis_url)
+    return WorkloadLimiter(max_active=max_active, redis_client=redis_client, key_prefix=settings.telemetry_namespace)
+
+
+@lru_cache
 def get_acquisition_service() -> AcquisitionService:
     return AcquisitionService(url_fetcher=get_url_fetcher())
 
 
 def get_ingestion_service() -> IngestionService:
+    settings = get_settings()
     return IngestionService(
         parser_registry=get_parser_registry(),
         chunking_engine=get_chunking_engine(),
@@ -282,6 +332,7 @@ def get_ingestion_service() -> IngestionService:
         term_index=get_term_index(),
         audit_logger=get_audit_logger(),
         metrics=get_metrics(),
+        enable_sparse_vectors=settings.storage.qdrant.sparse_vectors,
     )
 
 
@@ -299,8 +350,10 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         task_dispatcher=get_ingestion_task_dispatcher(),
         retry_intervals=settings.jobs.worker.retry_intervals,
         policy_advisor=get_policy_advisor(),
+        policy_synthesizer=get_policy_synthesizer(),
         parser_registry=get_parser_registry(),
         knowledge_base_store=get_knowledge_base_store(),
+        workload_limiter=get_workload_limiter(),
     )
 
 
@@ -322,6 +375,27 @@ def get_policy_advisor() -> PolicyAdvisor | None:
         )
     except RuntimeError as exc:
         LOGGER.warning("policy_advisor.disabled", extra={"error": str(exc)})
+        return None
+
+
+@lru_cache
+def get_policy_synthesizer() -> PolicySynthesizer | None:
+    settings = get_settings()
+    cfg = settings.policy_synthesis
+    if not cfg.enabled:
+        return None
+    api_key = cfg.api_key or os.getenv("CATALYST_POLICY_SYNTHESIS__api_key") or os.getenv("OPENAI_API_KEY")
+    try:
+        return LLMPolicySynthesizer(
+            enabled=cfg.enabled,
+            provider=cfg.provider,
+            model=cfg.model or "gpt-4o-mini",
+            api_key=api_key,
+            base_url=cfg.base_url,
+            sample_chars=cfg.sample_chars,
+        )
+    except RuntimeError as exc:
+        LOGGER.warning("policy_synthesizer.disabled", extra={"error": str(exc)})
         return None
 
 
@@ -402,11 +476,35 @@ def get_feedback_service() -> FeedbackService:
 
 
 def get_tenant(authorization: str = Header(alias="Authorization")) -> tuple[dict, object]:
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization header must be Bearer token")
-    token = authorization.split(" ", 1)[1]
-    claims = decode_jwt(token)
-    return claims, extract_tenant(claims)
+    settings = get_settings()
+    if authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+        claims = decode_jwt(token)
+        return claims, extract_tenant(claims)
+    if authorization.startswith("ApiKey "):
+        api_key = authorization.split(" ", 1)[1]
+        if not settings.security.api_key or api_key != settings.security.api_key:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+        claims = {
+            "org_id": settings.security.default_org_id,
+            "workspace_id": settings.security.default_workspace_id,
+            "user_id": settings.security.default_user_id,
+            "scopes": ["*"],
+            "auth": "api_key",
+        }
+        tenant = extract_tenant(claims)
+        return claims, tenant
+    if settings.security.allow_anonymous:
+        claims = {
+            "org_id": settings.security.default_org_id,
+            "workspace_id": settings.security.default_workspace_id,
+            "user_id": settings.security.default_user_id,
+            "scopes": ["*"],
+            "auth": "anonymous",
+        }
+        tenant = extract_tenant(claims)
+        return claims, tenant
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization header must be Bearer token or ApiKey")
 
 
 def require_scopes(*scopes: str):

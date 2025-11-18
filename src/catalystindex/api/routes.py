@@ -17,6 +17,7 @@ from .dependencies import (
     get_feedback_service,
     get_generation_service,
     get_ingestion_coordinator,
+    get_ingestion_job_store,
     get_metrics,
     get_search_service,
     get_knowledge_base_store,
@@ -31,11 +32,18 @@ class IngestRequest(BaseModel):
     document_title: str
     knowledge_base_id: str
     content: str | None = None
-    schema: str | None = None
+    content_uri_list: list[str] | None = Field(default=None, description="Optional list of URIs/paths for bulk ingest of multiple files")
+    schema_: str | None = Field(default=None, alias="schema")
     parser_hint: str | None = Field(default=None)
     source_type: str = Field(default="inline")
     content_uri: str | None = None
     metadata: dict = Field(default_factory=dict)
+    force_reprocess: bool = Field(default=False)
+    tenant_org: str | None = None
+    tenant_workspace: str | None = None
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class ChunkModel(BaseModel):
@@ -90,6 +98,8 @@ class IngestResponse(BaseModel):
 
 class BulkIngestRequest(BaseModel):
     documents: List[IngestRequest]
+    tenant_org: str | None = None
+    tenant_workspace: str | None = None
 
 
 class BulkIngestResponse(BaseModel):
@@ -110,6 +120,7 @@ class KnowledgeBaseModel(BaseModel):
     updated_at: datetime
     last_document_title: str | None = None
     last_ingested_at: datetime | None = None
+    documents: List[str] | None = None
 
 
 class KnowledgeBaseListResponse(BaseModel):
@@ -215,6 +226,7 @@ class FeedbackRequest(BaseModel):
     positive: bool = Field(default=True)
     comment: str | None = None
     metadata: dict | None = None
+    knowledge_base_ids: List[str] = Field(default_factory=lambda: ["*"])
 
 
 class FeedbackItemAnalyticsModel(BaseModel):
@@ -328,26 +340,45 @@ def ingest_document(
     coordinator: IngestionCoordinator = Depends(get_ingestion_coordinator),
 ):
     _claims, tenant = scopes
+    if request.tenant_org and request.tenant_workspace:
+        tenant = type(tenant)(
+            org_id=request.tenant_org,
+            workspace_id=request.tenant_workspace,
+            user_id=tenant.user_id,
+        )
+    elif "tenant_org" in request.metadata and "tenant_workspace" in request.metadata:
+        tenant = type(tenant)(
+            org_id=str(request.metadata.get("tenant_org")),
+            workspace_id=str(request.metadata.get("tenant_workspace")),
+            user_id=tenant.user_id,
+        )
     submission = DocumentSubmission(
         document_id=request.document_id,
         document_title=request.document_title,
         knowledge_base_id=request.knowledge_base_id,
-        schema=request.schema,
+        schema=request.schema_,
         source_type=request.source_type,
         parser_hint=request.parser_hint,
         metadata=request.metadata,
         content=request.content,
         content_uri=request.content_uri,
+        force_reprocess=request.force_reprocess,
     )
-    job = coordinator.ingest_document(tenant, submission)
+    try:
+        job = coordinator.ingest_document(tenant, submission)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc))
     document = job.documents[0]
-    return IngestResponse(
+    resp = IngestResponse(
         job_id=job.job_id,
         status=job.status.value,
         document=_document_to_model(document),
         created_at=job.created_at,
         updated_at=job.updated_at,
-    )
+    ).dict()
+    resp["created_at"] = job.created_at.isoformat()
+    resp["updated_at"] = job.updated_at.isoformat()
+    return resp
 
 
 @router.post("/ingest/bulk", response_model=BulkIngestResponse)
@@ -357,39 +388,92 @@ def ingest_bulk(
     coordinator: IngestionCoordinator = Depends(get_ingestion_coordinator),
 ):
     _claims, tenant = scopes
-    submissions = [
-        DocumentSubmission(
-            document_id=item.document_id,
-            document_title=item.document_title,
-            knowledge_base_id=item.knowledge_base_id,
-            schema=item.schema,
-            source_type=item.source_type,
-            parser_hint=item.parser_hint,
-            metadata=item.metadata,
-            content=item.content,
-            content_uri=item.content_uri,
-        )
-        for item in request.documents
-    ]
-    job = coordinator.ingest_bulk(tenant, submissions)
-    return BulkIngestResponse(
+    if hasattr(request, "tenant_org") and hasattr(request, "tenant_workspace"):
+        org = getattr(request, "tenant_org", None)
+        ws = getattr(request, "tenant_workspace", None)
+        if org and ws:
+            tenant = type(tenant)(org_id=org, workspace_id=ws, user_id=tenant.user_id)
+    elif getattr(request, "documents", None):
+        first_meta = request.documents[0].metadata if request.documents else {}
+        if isinstance(first_meta, dict) and "tenant_org" in first_meta and "tenant_workspace" in first_meta:
+            tenant = type(tenant)(
+                org_id=str(first_meta.get("tenant_org")),
+                workspace_id=str(first_meta.get("tenant_workspace")),
+                user_id=tenant.user_id,
+            )
+    submissions: list[DocumentSubmission] = []
+    for item in request.documents:
+        # Expand content_uri_list into multiple submissions if provided.
+        if item.content_uri_list:
+            for idx, uri in enumerate(item.content_uri_list, start=1):
+                submissions.append(
+                    DocumentSubmission(
+                        document_id=f"{item.document_id}-{idx}",
+                        document_title=item.document_title,
+                        knowledge_base_id=item.knowledge_base_id,
+                        schema=item.schema_,
+                        source_type=item.source_type,
+                        parser_hint=item.parser_hint,
+                        metadata=item.metadata,
+                        content=item.content if item.content else None,
+                        content_uri=uri,
+                        force_reprocess=item.force_reprocess,
+                    )
+                )
+        else:
+            submissions.append(
+                DocumentSubmission(
+                    document_id=item.document_id,
+                    document_title=item.document_title,
+                    knowledge_base_id=item.knowledge_base_id,
+                    schema=item.schema_,
+                    source_type=item.source_type,
+                    parser_hint=item.parser_hint,
+                    metadata=item.metadata,
+                    content=item.content,
+                    content_uri=item.content_uri,
+                    force_reprocess=item.force_reprocess,
+                )
+            )
+    try:
+        job = coordinator.ingest_bulk(tenant, submissions)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc))
+    resp = BulkIngestResponse(
         job_id=job.job_id,
         status=job.status.value,
         submitted=len(submissions),
         created_at=job.created_at,
         updated_at=job.updated_at,
         retry_intervals=list(coordinator.retry_intervals),
-    )
+    ).dict()
+    resp["created_at"] = job.created_at.isoformat()
+    resp["updated_at"] = job.updated_at.isoformat()
+    return resp
 
 
 @router.get("/knowledge-bases", response_model=KnowledgeBaseListResponse)
 def list_knowledge_bases(
     scopes = Depends(require_scopes("ingest:read")),
     store = Depends(get_knowledge_base_store),
+    job_store = Depends(get_ingestion_job_store),
 ):
     _claims, tenant = scopes
     records = store.list(tenant)
-    return KnowledgeBaseListResponse(knowledge_bases=[_knowledge_base_to_model(record) for record in records])
+    kb_docs: Dict[str, List[str]] = {}
+    try:
+        jobs = job_store.list(tenant)
+        for job in jobs:
+            for doc in job.documents:
+                kb_docs.setdefault(doc.knowledge_base_id, []).append(doc.document_id)
+    except Exception:
+        kb_docs = {}
+    return KnowledgeBaseListResponse(
+        knowledge_bases=[
+            _knowledge_base_to_model(record, kb_docs.get(record.knowledge_base_id))
+            for record in records
+        ]
+    )
 
 
 @router.get("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseModel)
@@ -403,6 +487,24 @@ def get_knowledge_base(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="knowledge base not found")
     return _knowledge_base_to_model(record)
+
+
+@router.patch("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseModel)
+def update_knowledge_base(
+    knowledge_base_id: str,
+    payload: dict,
+    scopes = Depends(require_scopes("ingest:write")),
+    store = Depends(get_knowledge_base_store),
+):
+    _claims, tenant = scopes
+    description = payload.get("description")
+    keywords = payload.get("keywords")
+    if keywords is not None and not isinstance(keywords, list):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="keywords must be a list if provided")
+    updated = store.update_description(tenant, knowledge_base_id, description=description, keywords=keywords)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="knowledge base not found")
+    return _knowledge_base_to_model(updated)
 
 
 @router.get("/ingest/jobs", response_model=List[JobSummaryModel])
@@ -435,14 +537,17 @@ def get_ingestion_job(
     job = coordinator.get_job(tenant, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
-    return JobDetailModel(
+    resp = JobDetailModel(
         job_id=job.job_id,
         status=job.status.value,
         created_at=job.created_at,
         updated_at=job.updated_at,
         error=job.error,
         documents=[_document_to_model(document) for document in job.documents],
-    )
+    ).dict()
+    resp["created_at"] = job.created_at.isoformat()
+    resp["updated_at"] = job.updated_at.isoformat()
+    return resp
 
 
 @router.get("/ingest/jobs/{job_id}/status", response_model=JobStatusModel)
@@ -459,7 +564,7 @@ def get_ingestion_job_status(
     failed = sum(1 for doc in job.documents if doc.status == DocumentStatus.FAILED)
     total = len(job.documents)
     status_value = job.status.value if hasattr(job.status, "value") else str(job.status)
-    return JobStatusModel(
+    resp = JobStatusModel(
         job_id=job.job_id,
         status=status_value,
         documents_total=total,
@@ -467,7 +572,9 @@ def get_ingestion_job_status(
         documents_failed=failed,
         updated_at=job.updated_at,
         error=job.error,
-    )
+    ).dict()
+    resp["updated_at"] = job.updated_at.isoformat()
+    return resp
 
 
 @router.post("/search/query", response_model=SearchResponse)
@@ -565,8 +672,10 @@ def submit_feedback(
     request: FeedbackRequest,
     scopes = Depends(require_scopes("feedback:write")),
     service: FeedbackService = Depends(get_feedback_service),
+    store = Depends(get_knowledge_base_store),
 ):
     _claims, tenant = scopes
+    knowledge_base_ids = _resolve_knowledge_base_ids(tenant, request.knowledge_base_ids, store)
     record = service.submit(
         tenant,
         query=request.query,
@@ -574,6 +683,7 @@ def submit_feedback(
         positive=request.positive,
         comment=request.comment,
         metadata=request.metadata,
+        knowledge_base_ids=knowledge_base_ids,
     )
     analytics_snapshot = service.analytics(tenant)
     return FeedbackResponseModel(
@@ -691,7 +801,7 @@ def _analytics_item_to_model(item: FeedbackItemSnapshot) -> FeedbackItemAnalytic
     )
 
 
-def _knowledge_base_to_model(record) -> KnowledgeBaseModel:
+def _knowledge_base_to_model(record, documents: List[str] | None = None) -> KnowledgeBaseModel:
     return KnowledgeBaseModel(
         knowledge_base_id=record.knowledge_base_id,
         description=record.description,
@@ -701,6 +811,7 @@ def _knowledge_base_to_model(record) -> KnowledgeBaseModel:
         updated_at=record.updated_at,
         last_document_title=record.last_document_title,
         last_ingested_at=record.last_ingested_at,
+        documents=documents,
     )
 
 

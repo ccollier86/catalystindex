@@ -25,6 +25,7 @@ Requires-Dist: python-magic>=0.4.27; extra == "ingestion"
 Requires-Dist: pi-heif>=0.7.0; extra == "ingestion"
 Requires-Dist: pikepdf>=8.15.1; extra == "ingestion"
 Requires-Dist: unstructured[docx,image,pdf,pptx,xlsx]>=0.15.8; extra == "ingestion"
+Requires-Dist: openai>=1.13.3; extra == "ingestion"
 
 # Catalyst Index RAG Platform
 

@@ -37,6 +37,8 @@ def decode_jwt(token: str) -> dict:
 
 def ensure_scopes(claims: dict, required_scopes: Iterable[str]) -> None:
     scopes: List[str] = claims.get("scopes", []) or []
+    if "*" in scopes:
+        return
     missing = [scope for scope in required_scopes if scope not in scopes]
     if missing:
         raise JWTAuthError(f"Missing required scopes: {', '.join(missing)}")

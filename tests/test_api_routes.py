@@ -84,6 +84,7 @@ def test_ingest_and_search_flow():
             "chunk_ids": [first_result["chunk_id"]],
             "positive": True,
             "comment": "Helpful context",
+            "knowledge_base_ids": [knowledge_base_id],
         },
         headers=headers,
     )

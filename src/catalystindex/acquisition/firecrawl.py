@@ -63,6 +63,7 @@ class FirecrawlFetcher(URLFetcher):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        # firecrawl v1 no longer accepts "format" in body; keep value for legacy mapping only.
         self._scrape_format = scrape_format
         self._opener = urllib.request.build_opener()
 
@@ -73,7 +74,8 @@ class FirecrawlFetcher(URLFetcher):
         metadata: Dict[str, object] | None = None,
         parser_hint: str | None = None,
     ) -> AcquisitionResult:
-        payload = json.dumps({"url": url, "format": self._scrape_format}).encode("utf-8")
+        # v1 expects only supported fields; omit deprecated "format" that now errors.
+        payload = json.dumps({"url": url}).encode("utf-8")
         request = urllib.request.Request(
             url=f"{self._base_url}/v1/scrape",
             data=payload,

@@ -44,6 +44,7 @@ def _build_submission(payload: Dict[str, object]) -> DocumentSubmission:
         metadata=dict(payload.get("metadata") or {}),
         content=payload.get("content"),
         content_uri=payload.get("content_uri"),
+        force_reprocess=bool(payload.get("force_reprocess", False)),
     )
 
 

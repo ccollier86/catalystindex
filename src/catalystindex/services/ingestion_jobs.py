@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,6 +20,8 @@ from ..telemetry.logger import AuditLogger, MetricsRecorder
 from .ingestion import IngestionService
 from .knowledge_base import KnowledgeBaseStore
 from .policy_advisor import PolicyAdvisor, PolicyAdvice
+from .policy_synthesizer import PolicySynthesizer, PolicySynthesisResult
+from .workload import WorkloadLimiter
 
 
 class IngestionJobStatus(str, Enum):
@@ -56,6 +59,7 @@ class DocumentSubmission:
     metadata: Dict[str, object]
     content: bytes | str | None
     content_uri: str | None
+    force_reprocess: bool = False
 
 
 @dataclass(slots=True)
@@ -143,6 +147,9 @@ class IngestionJobStore:
 
 
 class IngestionTaskDispatcher(Protocol):
+    def can_accept(self, count: int = 1) -> bool:
+        ...
+
     def enqueue(
         self,
         job_id: str,
@@ -772,6 +779,13 @@ def _tenant_key(tenant: Tenant) -> str:
     return f"{tenant.org_id}:{tenant.workspace_id}"
 
 
+def _slugify(value: str) -> str:
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
+    return cleaned or "kb"
+
+
 class IngestionCoordinator:
     """Coordinates ingestion submissions, acquisition, and job lifecycle."""
 
@@ -788,8 +802,10 @@ class IngestionCoordinator:
         task_dispatcher: IngestionTaskDispatcher | None = None,
         retry_intervals: Sequence[int] | None = None,
         policy_advisor: PolicyAdvisor | None = None,
+        policy_synthesizer: "PolicySynthesizer" | None = None,
         parser_registry: ParserRegistry | None = None,
         knowledge_base_store: KnowledgeBaseStore | None = None,
+        workload_limiter: WorkloadLimiter | None = None,
     ) -> None:
         if knowledge_base_store is None:
             raise ValueError("knowledge_base_store is required")
@@ -803,10 +819,12 @@ class IngestionCoordinator:
         self._task_dispatcher = task_dispatcher
         self._retry_intervals = tuple(retry_intervals or (15, 30, 60, 120))
         self._policy_advisor = policy_advisor
+        self._policy_synthesizer = policy_synthesizer
         self._parser_registry = parser_registry or default_registry()
         self._default_parser = "plain_text"
         self._logger = logging.getLogger(__name__)
         self._knowledge_bases = knowledge_base_store
+        self._workload_limiter = workload_limiter
 
     def ingest_document(self, tenant: Tenant, submission: DocumentSubmission) -> IngestionJobRecord:
         self._ensure_knowledge_bases(tenant, [submission])
@@ -817,6 +835,9 @@ class IngestionCoordinator:
 
     def ingest_bulk(self, tenant: Tenant, submissions: Sequence[DocumentSubmission]) -> IngestionJobRecord:
         self._ensure_knowledge_bases(tenant, submissions)
+        if self._task_dispatcher and hasattr(self._task_dispatcher, "can_accept"):
+            if not self._task_dispatcher.can_accept(len(submissions)):
+                raise RuntimeError("ingestion queue is saturated; try again later")
         record = self._job_store.create(tenant, submissions)
         if not submissions:
             return record
@@ -860,7 +881,10 @@ class IngestionCoordinator:
         for submission in submissions:
             kb_id = (submission.knowledge_base_id or "").strip()
             if not kb_id:
-                raise ValueError("knowledge_base_id is required for ingestion submissions")
+                # Derive KB from document title or id if not provided.
+                base = submission.document_title or submission.document_id
+                kb_id = _slugify(base) or submission.document_id
+                submission.knowledge_base_id = kb_id
             metadata = submission.metadata or {}
             description = metadata.get("knowledge_base_description")
             description_text = description if isinstance(description, str) else None
@@ -932,150 +956,213 @@ class IngestionCoordinator:
         job_id: str,
         submission: DocumentSubmission,
     ) -> JobDocumentResult:
-        try:
-            acquisition = self._acquisition.acquire(
-                source_type=submission.source_type,
-                content=submission.content,
-                content_uri=submission.content_uri,
-                metadata=submission.metadata,
-                parser_hint=submission.parser_hint,
-            )
-        except Exception:
-            self._metrics.record_dependency_failure("acquisition")
+        limiter_ctx = self._workload_limiter.slot(submission.document_id) if self._workload_limiter else nullcontext({})
+        with limiter_ctx:
+            try:
+                acquisition = self._acquisition.acquire(
+                    source_type=submission.source_type,
+                    content=submission.content,
+                    content_uri=submission.content_uri,
+                    metadata=submission.metadata,
+                    parser_hint=submission.parser_hint,
+                )
+            except Exception:
+                self._metrics.record_dependency_failure("acquisition")
+                self._record_stage(
+                    job_id,
+                    submission.document_id,
+                    "acquired",
+                    "failed",
+                    {"error": "acquisition_failed"},
+                )
+                raise
             self._record_stage(
                 job_id,
                 submission.document_id,
                 "acquired",
-                "failed",
-                {"error": "acquisition_failed"},
+                "succeeded",
+                {
+                    "content_type": acquisition.content_type,
+                    "parser_hint": acquisition.parser_hint,
+                },
             )
-            raise
-        self._record_stage(
-            job_id,
-            submission.document_id,
-            "acquired",
-            "succeeded",
-            {
-                "content_type": acquisition.content_type,
-                "parser_hint": acquisition.parser_hint,
-            },
-        )
-        artifact = self._artifact_store.store_document(
-            tenant,
-            job_id=job_id,
-            document_id=submission.document_id,
-            content=acquisition.content,
-            content_type=acquisition.content_type,
-            metadata=acquisition.metadata,
-        )
-        advisor_policy = None
-        advisor_parser_hint = None
-        advisor_overrides: Dict[str, object] = {}
-        advisor_metadata: Dict[str, object] = {}
-        if self._policy_advisor and not submission.schema:
-            preview = self._preview_text(acquisition.content)
-            advice = self._policy_advisor.advise(
-                title=submission.document_title,
-                schema=submission.schema,
-                content=preview,
+            acquisition.metadata.setdefault("knowledge_base_id", submission.knowledge_base_id)
+            artifact = self._artifact_store.store_document(
+                tenant,
+                job_id=job_id,
+                document_id=submission.document_id,
+                knowledge_base_id=submission.knowledge_base_id,
+                content=acquisition.content,
+                content_type=acquisition.content_type,
+                metadata=acquisition.metadata,
             )
-            if advice.policy_name:
-                advisor_policy = advice.policy_name
-            if advice.confidence is not None:
-                advisor_metadata["advisor_confidence"] = advice.confidence
-            if advice.notes:
-                advisor_metadata["advisor_notes"] = advice.notes
-            if advice.tags:
-                advisor_metadata["advisor_tags"] = advice.tags
-            if advice.parser_hint:
-                advisor_parser_hint = advice.parser_hint
-            if advice.chunk_overrides:
-                advisor_overrides = advice.chunk_overrides
-        policy_hint = submission.schema or advisor_policy
-        policy = self._resolve_policy(policy_hint)
-        if advisor_overrides:
-            policy = _apply_policy_overrides(policy, advisor_overrides)
-            advisor_metadata.setdefault("advisor_policy_overrides", advisor_overrides)
-        parser_name, parser_source = self._select_parser(
-            submission,
-            advisor_parser_hint,
-            acquisition.parser_hint,
-            acquisition.content_type,
-        )
-        document_metadata = {
-            **acquisition.metadata,
-            **submission.metadata,
-            "artifact_uri": artifact.uri,
-            "source_type": submission.source_type,
-            "knowledge_base_id": submission.knowledge_base_id,
-            "parser_source": parser_source,
-        }
-        if advisor_policy:
-            document_metadata["advisor_policy"] = advisor_policy
-        document_metadata.update(advisor_metadata)
-        if acquisition.content_type and "content_type" not in document_metadata:
-            document_metadata["content_type"] = acquisition.content_type
-        if advisor_parser_hint:
-            document_metadata.setdefault("advisor_parser", advisor_parser_hint)
-        ingestion_result = self._ingestion_service.ingest(
-            tenant=tenant,
-            document_id=submission.document_id,
-            document_title=submission.document_title,
-            content=acquisition.content,
-            policy=policy,
-            parser_name=parser_name,
-            document_metadata=document_metadata,
-            progress_callback=lambda stage, status, info: self._record_stage(
+            advisor_policy = None
+            advisor_parser_hint = None
+            advisor_overrides: Dict[str, object] = {}
+            advisor_metadata: Dict[str, object] = {}
+            if self._policy_advisor and not submission.schema:
+                preview = self._preview_text(acquisition.content)
+                advice = self._policy_advisor.advise(
+                    title=submission.document_title,
+                    schema=submission.schema,
+                    content=preview,
+                )
+                if advice.policy_name:
+                    advisor_policy = advice.policy_name
+                if advice.confidence is not None:
+                    advisor_metadata["advisor_confidence"] = advice.confidence
+                if advice.notes:
+                    advisor_metadata["advisor_notes"] = advice.notes
+                if advice.tags:
+                    advisor_metadata["advisor_tags"] = advice.tags
+                if advice.parser_hint:
+                    advisor_parser_hint = advice.parser_hint
+                if advice.chunk_overrides:
+                    advisor_overrides = advice.chunk_overrides
+            # Advisor-first policy selection, then explicit override, then default.
+            policy_hint = advisor_policy or submission.schema
+            policy = self._resolve_policy(policy_hint)
+            if advisor_overrides:
+                policy = _apply_policy_overrides(policy, advisor_overrides)
+                advisor_metadata.setdefault("advisor_policy_overrides", advisor_overrides)
+
+            synthesis_metadata: Dict[str, object] = {}
+            if (
+                self._policy_synthesizer
+                and not submission.schema
+                and policy.policy_name == "default"
+            ):
+                preview = self._preview_text(acquisition.content)
+                synthesis = self._policy_synthesizer.synthesize(
+                    title=submission.document_title,
+                    content=preview,
+                    existing_policy=policy.policy_name,
+                    advisor_tags=advisor_metadata.get("advisor_tags"),
+                )
+                if synthesis:
+                    overrides = synthesis.to_overrides()
+                    if overrides:
+                        policy = _apply_policy_overrides(policy, overrides)
+                    synthesis_metadata = {
+                        "synthesized_policy": {
+                            "chunk_modes": synthesis.chunk_modes,
+                            "window_size": synthesis.window_size,
+                            "window_overlap": synthesis.window_overlap,
+                            "max_chunk_tokens": synthesis.max_chunk_tokens,
+                            "highlight_phrases": synthesis.highlight_phrases,
+                            "notes": synthesis.notes,
+                            "confidence": synthesis.confidence,
+                        }
+                    }
+            parser_name, parser_source = self._select_parser(
+                submission,
+                advisor_parser_hint,
+                acquisition.parser_hint,
+                acquisition.content_type,
+            )
+            document_metadata = {
+                **acquisition.metadata,
+                **submission.metadata,
+                "artifact_uri": artifact.uri,
+                "source_type": submission.source_type,
+                "knowledge_base_id": submission.knowledge_base_id,
+                "parser_source": parser_source,
+            }
+            if advisor_policy:
+                document_metadata["advisor_policy"] = advisor_policy
+            document_metadata.update(advisor_metadata)
+            document_metadata.update(synthesis_metadata)
+            if acquisition.content_type and "content_type" not in document_metadata:
+                document_metadata["content_type"] = acquisition.content_type
+            if advisor_parser_hint:
+                document_metadata.setdefault("advisor_parser", advisor_parser_hint)
+            cached_artifacts = None
+            if not submission.force_reprocess:
+                cached_artifacts = self._load_cached_artifacts(
+                    tenant,
+                    submission.document_id,
+                    submission.knowledge_base_id,
+                )
+
+            if cached_artifacts:
+                ingestion_result = self._ingestion_service.ingest_from_cache(
+                    tenant=tenant,
+                    document_id=submission.document_id,
+                    document_title=submission.document_title,
+                    policy=policy,
+                    cached_chunks=cached_artifacts["chunks"],
+                    cached_embeddings=cached_artifacts["embeddings"],
+                    document_metadata=document_metadata,
+                    progress_callback=lambda stage, status, info: self._record_stage(
+                        job_id,
+                        submission.document_id,
+                        stage,
+                        status,
+                        info,
+                    ),
+                )
+            else:
+                ingestion_result = self._ingestion_service.ingest(
+                    tenant=tenant,
+                    document_id=submission.document_id,
+                    document_title=submission.document_title,
+                    content=acquisition.content,
+                    policy=policy,
+                    parser_name=parser_name,
+                    document_metadata=document_metadata,
+                    progress_callback=lambda stage, status, info: self._record_stage(
+                        job_id,
+                        submission.document_id,
+                        stage,
+                        status,
+                        info,
+                    ),
+                )
+            self._persist_pipeline_artifacts(
+                tenant,
                 job_id,
                 submission.document_id,
-                stage,
-                status,
-                info,
-            ),
-        )
-        self._persist_pipeline_artifacts(
-            tenant,
-            job_id,
-            submission.document_id,
-            policy=ingestion_result.policy,
-            chunks=ingestion_result.chunks,
-            embeddings=ingestion_result.embeddings,
-        )
-        keywords = self._collect_keywords(ingestion_result.chunks)
-        try:
-            self._knowledge_bases.record_document_ingested(
+                knowledge_base_id=submission.knowledge_base_id,
+                policy=ingestion_result.policy,
+                chunks=ingestion_result.chunks,
+                embeddings=ingestion_result.embeddings,
+                cache_document=submission.document_id,
+            )
+            keywords = self._collect_keywords(ingestion_result.chunks)
+            try:
+                self._knowledge_bases.record_document_ingested(
+                    tenant,
+                    submission.knowledge_base_id,
+                    document_title=submission.document_title,
+                    keywords=keywords,
+                )
+            except Exception:  # pragma: no cover - catalog updates must not break ingestion
+                self._logger.warning(
+                    "knowledge_base.update_failed",
+                    extra={"knowledge_base_id": submission.knowledge_base_id, "document_id": submission.document_id},
+                    exc_info=True,
+                )
+            self._audit_logger.ingest_completed(
                 tenant,
-                submission.knowledge_base_id,
-                document_title=submission.document_title,
-                keywords=keywords,
+                document_id=submission.document_id,
+                chunk_count=len(ingestion_result.chunks),
+                policy=ingestion_result.policy.policy_name,
+                job_id=job_id,
+                source_type=submission.source_type,
             )
-        except Exception:  # pragma: no cover - catalog updates must not break ingestion
-            self._logger.warning(
-                "knowledge_base.update_failed",
-                extra={"knowledge_base_id": submission.knowledge_base_id, "document_id": submission.document_id},
-                exc_info=True,
+            return JobDocumentResult(
+                document_id=submission.document_id,
+                knowledge_base_id=submission.knowledge_base_id,
+                status=DocumentStatus.SUCCEEDED,
+                policy=ingestion_result.policy.policy_name,
+                chunk_count=len(ingestion_result.chunks),
+                artifact_uri=artifact.uri,
+                artifact_content_type=artifact.content_type,
+                artifact_metadata=dict(artifact.metadata),
+                parser=parser_name,
+                metadata=document_metadata,
+                chunks=ingestion_result.chunks,
             )
-        self._audit_logger.ingest_completed(
-            tenant,
-            document_id=submission.document_id,
-            chunk_count=len(ingestion_result.chunks),
-            policy=ingestion_result.policy.policy_name,
-            job_id=job_id,
-            source_type=submission.source_type,
-        )
-        return JobDocumentResult(
-            document_id=submission.document_id,
-            knowledge_base_id=submission.knowledge_base_id,
-            status=DocumentStatus.SUCCEEDED,
-            policy=ingestion_result.policy.policy_name,
-            chunk_count=len(ingestion_result.chunks),
-            artifact_uri=artifact.uri,
-            artifact_content_type=artifact.content_type,
-            artifact_metadata=dict(artifact.metadata),
-            parser=parser_name,
-            metadata=document_metadata,
-            chunks=ingestion_result.chunks,
-        )
 
     def _record_job_metrics_if_finished(self, job: IngestionJobRecord) -> None:
         if job.status not in {
@@ -1160,15 +1247,45 @@ class IngestionCoordinator:
             return "html"
         return None
 
+    def _load_cached_artifacts(
+        self,
+        tenant: Tenant,
+        document_id: str,
+        knowledge_base_id: str,
+    ) -> Dict[str, object] | None:
+        cache_job = _cache_job_id(document_id)
+        try:
+            chunks = self._artifact_store.load_json_artifact(
+                tenant,
+                job_id=cache_job,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                name="chunks",
+            )
+            embeddings = self._artifact_store.load_json_artifact(
+                tenant,
+                job_id=cache_job,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                name="embeddings",
+            )
+        except Exception:
+            return None
+        if chunks and embeddings:
+            return {"chunks": chunks, "embeddings": embeddings}
+        return None
+
     def _persist_pipeline_artifacts(
         self,
         tenant: Tenant,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str,
         *,
         policy: ChunkingPolicy,
         chunks: Sequence[ChunkRecord],
         embeddings: Sequence[Sequence[float]],
+        cache_document: str | None = None,
     ) -> None:
         payloads: Dict[str, object] = {
             "policy": _policy_to_dict(policy),
@@ -1181,21 +1298,24 @@ class IngestionCoordinator:
                 "artifact_store.embedding_mismatch",
                 extra={"document_id": document_id, "chunk_count": len(chunks), "embedding_count": len(embeddings)},
             )
+        cache_job_id = _cache_job_id(cache_document or document_id)
         for name, payload in payloads.items():
-            try:
-                self._artifact_store.store_json_artifact(
-                    tenant,
-                    job_id=job_id,
-                    document_id=document_id,
-                    name=name,
-                    payload=payload,
-                )
-            except Exception:  # pragma: no cover - defensive logging
-                self._logger.warning(
-                    "artifact_store.persist_failed",
-                    extra={"document_id": document_id, "artifact": name},
-                    exc_info=True,
-                )
+            for target_job in (job_id, cache_job_id):
+                try:
+                    self._artifact_store.store_json_artifact(
+                        tenant,
+                        job_id=target_job,
+                        document_id=document_id,
+                        knowledge_base_id=knowledge_base_id,
+                        name=name,
+                        payload=payload,
+                    )
+                except Exception:  # pragma: no cover - defensive logging
+                    self._logger.warning(
+                        "artifact_store.persist_failed",
+                        extra={"document_id": document_id, "artifact": name, "job_id": target_job},
+                        exc_info=True,
+                    )
 
 
 __all__ = [
@@ -1290,3 +1410,7 @@ def _apply_policy_overrides(policy: ChunkingPolicy, overrides: Dict[str, object]
     if not updates:
         return policy
     return replace(policy, **updates)
+
+
+def _cache_job_id(document_id: str) -> str:
+    return f"_cache/{document_id}"

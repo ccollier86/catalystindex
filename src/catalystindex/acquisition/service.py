@@ -72,13 +72,64 @@ class AcquisitionService:
                 parser_hint=inferred_parser,
                 metadata=metadata,
             )
+        if normalized_type == "local_file":
+            if content_uri:
+                path = content_uri
+            elif isinstance(content, str):
+                path = content
+            else:
+                raise ValueError("local_file sources must provide a file path in content or content_uri")
+            try:
+                with open(path, "rb") as fh:
+                    payload = fh.read()
+            except FileNotFoundError as exc:
+                raise ValueError(f"Local file not found: {path}") from exc
+            metadata.setdefault("source_type", normalized_type)
+            metadata.setdefault("filename", path.rsplit("/", 1)[-1])
+            content_type = metadata.get("content_type") or self._detect_content_type(payload, metadata, source_hint=path)
+            metadata.setdefault("content_type", content_type)
+            inferred_parser = parser_hint or self._parser_hint_from_content_type(content_type)
+            return AcquisitionResult(
+                content=payload,
+                content_type=content_type,
+                source_uri=path,
+                parser_hint=inferred_parser,
+                metadata=metadata,
+            )
+        if normalized_type == "s3":
+            if not content_uri:
+                raise ValueError("s3 sources must provide content_uri (e.g., s3://bucket/key)")
+            bucket, key = self._parse_s3_uri(content_uri)
+            try:
+                import boto3  # type: ignore
+            except Exception as exc:
+                raise RuntimeError("boto3 is required for s3 acquisition") from exc
+            s3 = boto3.client("s3")
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            payload = obj["Body"].read()
+            metadata.setdefault("source_type", normalized_type)
+            metadata.setdefault("filename", key.rsplit("/", 1)[-1])
+            content_type = metadata.get("content_type") or obj.get("ContentType") or self._detect_content_type(
+                payload,
+                metadata,
+                source_hint=key,
+            )
+            metadata.setdefault("content_type", content_type)
+            inferred_parser = parser_hint or self._parser_hint_from_content_type(content_type)
+            return AcquisitionResult(
+                content=payload,
+                content_type=content_type,
+                source_uri=content_uri,
+                parser_hint=inferred_parser,
+                metadata=metadata,
+            )
         if normalized_type == "url":
             if not content_uri:
                 raise ValueError("URL sources must provide content_uri")
             fetcher = self._url_fetcher
             if fetcher is None:
                 raise RuntimeError("URL acquisition requested but no URL fetcher is configured")
-            result = fetcher.fetch(content_uri, metadata=metadata, parser_hint=parser_hint)
+            result = self._fetch_with_fallback(fetcher, content_uri, metadata, parser_hint)
             result.metadata.setdefault("source_type", normalized_type)
             result.metadata.setdefault("fetched_uri", content_uri)
             if result.source_uri is None:
@@ -93,6 +144,27 @@ class AcquisitionService:
                 result.parser_hint = self._parser_hint_from_content_type(result.content_type)
             return result
         raise ValueError(f"Unsupported source_type '{source_type}'")
+
+    def _fetch_with_fallback(
+        self,
+        fetcher: URLFetcher,
+        url: str,
+        metadata: Dict[str, object],
+        parser_hint: str | None,
+    ) -> AcquisitionResult:
+        try:
+            return fetcher.fetch(url, metadata=metadata, parser_hint=parser_hint)
+        except Exception as exc:
+            # Firecrawl cannot reach host-only addresses; fall back to direct HTTP in those cases.
+            if fetcher.__class__.__name__ == "FirecrawlFetcher" or self._is_internal_url(url):
+                from .firecrawl import HttpURLFetcher  # local import to avoid circular dependency
+                http_fetcher = HttpURLFetcher()
+                return http_fetcher.fetch(url, metadata=metadata, parser_hint=parser_hint)
+            raise
+
+    def _is_internal_url(self, url: str) -> bool:
+        lowered = url.lower()
+        return any(host in lowered for host in ("localhost", "127.0.0.1", "host.docker.internal"))
 
     def _detect_content_type(
         self,
@@ -153,6 +225,14 @@ class AcquisitionService:
     def _looks_like_html(self, sample: bytes) -> bool:
         lowered = sample.lower()
         return b"<html" in lowered or b"<body" in lowered
+
+    def _parse_s3_uri(self, uri: str) -> tuple[str, str]:
+        if not uri.lower().startswith("s3://"):
+            raise ValueError(f"Invalid s3 uri: {uri}")
+        parts = uri[5:].split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(f"Invalid s3 uri: {uri}")
+        return parts[0], parts[1]
 
     def _parser_hint_from_content_type(self, content_type: Optional[str]) -> Optional[str]:
         if not content_type:

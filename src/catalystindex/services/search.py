@@ -125,7 +125,9 @@ class SearchService:
                 self._metrics.record_dependency_failure("qdrant")
                 raise
             if results:
-                results_by_track[track.name] = results
+                filtered = self._filter_noisy_chunks(results)
+                if filtered:
+                    results_by_track[track.name] = filtered
 
         fused_results = self._fuse_results(results_by_track, limit)
         if (
@@ -163,6 +165,16 @@ class SearchService:
         return SearchExecution(results=final_results, debug=debug, explanations=explanations)
 
     # Internal helpers -------------------------------------------------
+    def _filter_noisy_chunks(self, results: Sequence[RetrievalResult]) -> List[RetrievalResult]:
+        filtered: List[RetrievalResult] = []
+        for res in results:
+            meta = res.chunk.metadata or {}
+            token_count = int(meta.get("token_count", 0) or 0)
+            if token_count and token_count < 8:
+                continue
+            filtered.append(res)
+        return filtered
+
     def _expand_query(self, tenant: Tenant, query: str, options: SearchOptions) -> Tuple[str, Tuple[str, ...]]:
         if not self._term_index or not options.alias_enabled:
             return query, ()

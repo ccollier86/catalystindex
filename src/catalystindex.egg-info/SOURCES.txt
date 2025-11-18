@@ -31,6 +31,7 @@ src/catalystindex/services/ingestion.py
 src/catalystindex/services/ingestion_jobs.py
 src/catalystindex/services/knowledge_base.py
 src/catalystindex/services/policy_advisor.py
+src/catalystindex/services/policy_synthesizer.py
 src/catalystindex/services/search.py
 src/catalystindex/storage/term_index.py
 src/catalystindex/storage/vector_store.py

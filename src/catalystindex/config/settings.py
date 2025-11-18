@@ -12,6 +12,11 @@ class SecuritySettings(BaseModel):
     jwt_secret: str = Field(default="dev-secret", description="HS256 secret for JWT validation")
     jwt_algorithm: str = Field(default="HS256", description="JWT signing algorithm")
     required_scopes: List[str] = Field(default_factory=list, description="Scopes required for the active endpoint")
+    api_key: str | None = Field(default=None, description="Static API key for simple auth")
+    default_org_id: str = Field(default="org1", description="Default org for API key auth")
+    default_workspace_id: str = Field(default="ws1", description="Default workspace for API key auth")
+    default_user_id: str = Field(default="user1", description="Default user for API key auth")
+    allow_anonymous: bool = Field(default=False, description="Allow anonymous access without auth")
 
 
 class QdrantSettings(BaseModel):
@@ -23,6 +28,14 @@ class QdrantSettings(BaseModel):
     collection_prefix: str = "catalystindex"
     prefer_grpc: bool = False
     sparse_vectors: bool = False
+    # Bulk/index tuning
+    hnsw_m: int | None = None
+    hnsw_m_final: int | None = None
+    indexing_threshold_kb: int | None = None
+    shard_number: int | None = None
+    on_disk_vectors: bool | None = None
+    hnsw_on_disk: bool | None = None
+    defer_indexing: bool = False
 
 
 class RedisSettings(BaseModel):
@@ -33,7 +46,7 @@ class RedisSettings(BaseModel):
 
 class S3ArtifactSettings(BaseModel):
     bucket: str = Field(default="", description="Bucket name for the artifact store")
-    prefix: str = Field(default="", description="Key prefix for stored artifacts")
+    prefix: str | None = Field(default="", description="Key prefix for stored artifacts")
     region: str | None = Field(default=None, description="AWS region for the bucket")
     endpoint_url: str | None = Field(default=None, description="Custom endpoint for S3-compatible storage")
 
@@ -81,6 +94,10 @@ class EmbeddingsSettings(BaseModel):
     api_key: str | None = Field(default=None, description="API key for hosted embedding providers")
     base_url: str | None = Field(default=None, description="Override base URL for OpenAI-compatible endpoints")
     dimension: int = Field(default=3072, description="Expected embedding dimension")
+    allow_hash_fallback: bool = Field(
+        default=True,
+        description="Enable dev-lite hash embeddings when a hosted provider is unavailable",
+    )
 
 
 class PolicyAdvisorSettings(BaseModel):
@@ -90,6 +107,15 @@ class PolicyAdvisorSettings(BaseModel):
     api_key: str | None = Field(default=None, description="API key for the provider")
     base_url: str | None = Field(default=None, description="Optional base URL override")
     sample_chars: int = Field(default=4000, description="How many characters of the document to sample")
+
+
+class PolicySynthesisSettings(BaseModel):
+    enabled: bool = Field(default=False, description="Enable LLM-driven policy synthesis when templates are missing")
+    provider: str = Field(default="openai", description="LLM provider")
+    model: str | None = Field(default="gpt-4o-mini", description="Model used for synthesis")
+    api_key: str | None = Field(default=None, description="API key for the provider")
+    base_url: str | None = Field(default=None, description="Optional base URL override")
+    sample_chars: int = Field(default=4000, description="How many characters to sample for synthesis")
 
 
 class RerankerSettings(BaseModel):
@@ -114,6 +140,8 @@ class JobWorkerSettings(BaseModel):
     default_timeout: int = Field(default=900, description="Default timeout (seconds) for ingestion tasks")
     max_retries: int = Field(default=3, description="Maximum retry attempts for ingestion tasks")
     retry_intervals: List[int] = Field(default_factory=lambda: [15, 30, 60, 120])
+    max_active_docs: int = Field(default=4, description="Maximum concurrently running documents per worker")
+    max_queue_length: int = Field(default=200, description="Maximum queued documents before backpressure")
 
 
 class JobSettings(BaseModel):
@@ -129,6 +157,7 @@ class AppSettings(BaseModel):
     embeddings: EmbeddingsSettings = Field(default_factory=EmbeddingsSettings)
     reranker: RerankerSettings = Field(default_factory=RerankerSettings)
     policy_advisor: PolicyAdvisorSettings = Field(default_factory=PolicyAdvisorSettings)
+    policy_synthesis: PolicySynthesisSettings = Field(default_factory=PolicySynthesisSettings)
     telemetry_namespace: str = "catalystindex"
     metrics_exporter_port: int | None = 9464
     metrics_exporter_address: str = "0.0.0.0"
@@ -143,7 +172,31 @@ def get_settings() -> AppSettings:
     overrides = _load_env_overrides()
     if not overrides:
         return base
-    return AppSettings(**overrides)
+    settings = overrides if isinstance(overrides, AppSettings) else AppSettings(**overrides)
+    if isinstance(settings, dict):
+        settings = AppSettings(**settings)
+    updates = {}
+    if isinstance(settings.security, dict):
+        updates["security"] = SecuritySettings(**settings.security)
+    if isinstance(settings.storage, dict):
+        updates["storage"] = StorageSettings(**settings.storage)
+    if isinstance(settings.features, dict):
+        updates["features"] = FeatureFlags(**settings.features)
+    if isinstance(settings.embeddings, dict):
+        updates["embeddings"] = EmbeddingsSettings(**settings.embeddings)
+    if isinstance(settings.reranker, dict):
+        updates["reranker"] = RerankerSettings(**settings.reranker)
+    if isinstance(settings.policy_advisor, dict):
+        updates["policy_advisor"] = PolicyAdvisorSettings(**settings.policy_advisor)
+    if isinstance(settings.policy_synthesis, dict):
+        updates["policy_synthesis"] = PolicySynthesisSettings(**settings.policy_synthesis)
+    if isinstance(settings.jobs, dict):
+        updates["jobs"] = JobSettings(**settings.jobs)
+    if isinstance(settings.acquisition, dict):
+        updates["acquisition"] = AcquisitionSettings(**settings.acquisition)
+    if updates:
+        settings = settings.model_copy(update=updates)
+    return settings
 
 
 def _load_env_overrides(prefix: str = "CATALYST_") -> dict:
@@ -165,6 +218,8 @@ def _load_env_overrides(prefix: str = "CATALYST_") -> dict:
 
 
 def _coerce_env_value(value: str):
+    if value == "":
+        return None
     lowered = value.lower()
     if lowered in {"true", "false"}:
         return lowered == "true"

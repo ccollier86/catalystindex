@@ -7,21 +7,42 @@ services:
     env_file:
       - ../.env
     environment:
+      CATALYST_ENVIRONMENT: dev
+      CATALYST_STORAGE__vector_backend: qdrant
       CATALYST_STORAGE__qdrant__host: qdrant
-      CATALYST_STORAGE__qdrant__sparse_vectors: "false"
-      CATALYST_STORAGE__vector_backend: memory
+      CATALYST_STORAGE__qdrant__port: 6333
+      CATALYST_STORAGE__qdrant__sparse_vectors: ${CATALYST_STORAGE__qdrant__sparse_vectors:-true}
+      CATALYST_STORAGE__term_index_backend: redis
       CATALYST_STORAGE__redis__url: redis://redis:6379/0
+      CATALYST_STORAGE__artifacts__backend: ${CATALYST_STORAGE__artifacts__backend:-s3}
+      CATALYST_STORAGE__artifacts__base_path: /data/artifacts
+      CATALYST_STORAGE__artifacts__local__base_path: ${CATALYST_STORAGE__artifacts__local__base_path:-/data/artifacts}
+      CATALYST_STORAGE__artifacts__s3__bucket: ${CATALYST_STORAGE__artifacts__s3__bucket:-catalyst-index--use1-az4--xa-s3}
+      CATALYST_STORAGE__artifacts__s3__prefix: ${CATALYST_STORAGE__artifacts__s3__prefix:-}
+      CATALYST_STORAGE__artifacts__s3__region: ${CATALYST_STORAGE__artifacts__s3__region:-us-east-1}
       CATALYST_JOBS__store__redis_url: redis://redis:6379/1
       CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
-      CATALYST_EMBEDDINGS__provider: hash
-      CATALYST_RERANKER__enabled: "false"
-      CATALYST_POLICY_ADVISOR__enabled: "false"
+      CATALYST_JOBS__worker__enabled: "true"
+      CATALYST_JOBS__worker__queue_name: ingestion
+      CATALYST_JOBS__worker__max_active_docs: 4
+      CATALYST_JOBS__worker__max_queue_length: 200
+      CATALYST_EMBEDDINGS__provider: ${CATALYST_EMBEDDINGS__provider:-openai}
+      CATALYST_EMBEDDINGS__allow_hash_fallback: ${CATALYST_EMBEDDINGS__allow_hash_fallback:-false}
+      CATALYST_RERANKER__enabled: ${CATALYST_RERANKER__enabled:-true}
+      CATALYST_RERANKER__provider: ${CATALYST_RERANKER__provider:-cohere}
+      CATALYST_RERANKER__model: ${CATALYST_RERANKER__model:-rerank-v3.5}
+      CATALYST_POLICY_ADVISOR__enabled: ${CATALYST_POLICY_ADVISOR__enabled:-true}
+      CATALYST_POLICY_SYNTHESIS__enabled: ${CATALYST_POLICY_SYNTHESIS__enabled:-true}
+      CATALYST_FEATURES__enable_metrics: "false"
+      CATALYST_METRICS_EXPORTER_PORT: 9464
     ports:
       - "18888:8000"
     depends_on:
       - postgres
       - redis
       - qdrant
+    volumes:
+      - artifacts_data:/data/artifacts
 
   worker:
     build:
@@ -30,26 +51,45 @@ services:
     env_file:
       - ../.env
     environment:
+      CATALYST_ENVIRONMENT: dev
+      CATALYST_STORAGE__vector_backend: qdrant
       CATALYST_STORAGE__qdrant__host: qdrant
-      CATALYST_STORAGE__qdrant__sparse_vectors: "false"
-      CATALYST_STORAGE__vector_backend: memory
+      CATALYST_STORAGE__qdrant__port: 6333
+      CATALYST_STORAGE__qdrant__sparse_vectors: ${CATALYST_STORAGE__qdrant__sparse_vectors:-true}
+      CATALYST_STORAGE__term_index_backend: redis
       CATALYST_STORAGE__redis__url: redis://redis:6379/0
+      CATALYST_STORAGE__artifacts__backend: ${CATALYST_STORAGE__artifacts__backend:-s3}
+      CATALYST_STORAGE__artifacts__base_path: /data/artifacts
+      CATALYST_STORAGE__artifacts__local__base_path: ${CATALYST_STORAGE__artifacts__local__base_path:-/data/artifacts}
+      CATALYST_STORAGE__artifacts__s3__bucket: ${CATALYST_STORAGE__artifacts__s3__bucket:-catalyst-index--use1-az4--xa-s3}
+      CATALYST_STORAGE__artifacts__s3__prefix: ${CATALYST_STORAGE__artifacts__s3__prefix:-}
+      CATALYST_STORAGE__artifacts__s3__region: ${CATALYST_STORAGE__artifacts__s3__region:-us-east-1}
       CATALYST_JOBS__store__redis_url: redis://redis:6379/1
       CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
       CATALYST_JOBS__worker__queue_name: ingestion
-      CATALYST_EMBEDDINGS__provider: hash
-      CATALYST_RERANKER__enabled: "false"
-      CATALYST_POLICY_ADVISOR__enabled: "false"
+      CATALYST_JOBS__worker__enabled: "true"
+      CATALYST_JOBS__worker__max_active_docs: 4
+      CATALYST_JOBS__worker__max_queue_length: 200
+      CATALYST_EMBEDDINGS__provider: ${CATALYST_EMBEDDINGS__provider:-openai}
+      CATALYST_EMBEDDINGS__allow_hash_fallback: ${CATALYST_EMBEDDINGS__allow_hash_fallback:-false}
+      CATALYST_RERANKER__enabled: ${CATALYST_RERANKER__enabled:-true}
+      CATALYST_RERANKER__provider: ${CATALYST_RERANKER__provider:-cohere}
+      CATALYST_RERANKER__model: ${CATALYST_RERANKER__model:-rerank-v3.5}
+      CATALYST_POLICY_ADVISOR__enabled: ${CATALYST_POLICY_ADVISOR__enabled:-false}
+      CATALYST_POLICY_SYNTHESIS__enabled: ${CATALYST_POLICY_SYNTHESIS__enabled:-false}
+      CATALYST_FEATURES__enable_metrics: "false"
+      CATALYST_METRICS_EXPORTER_PORT: 9464
     depends_on:
       - postgres
       - redis
       - qdrant
+    volumes:
+      - artifacts_data:/data/artifacts
 
   postgres:
     image: postgres:15
     restart: unless-stopped
-    ports:
-      - "5433:5432"
+    ports: []
     environment:
       POSTGRES_USER: catalyst
       POSTGRES_PASSWORD: catalyst
@@ -60,18 +100,15 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    ports: []
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     volumes:
       - redis_data:/data
 
   qdrant:
-    image: qdrant/qdrant:v1.7.3
+    image: qdrant/qdrant:v1.15.1
     restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    ports: []
     volumes:
       - qdrant_data:/qdrant/storage
 
@@ -79,3 +116,4 @@ volumes:
   pg_data:
   redis_data:
   qdrant_data:
+  artifacts_data:

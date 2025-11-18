@@ -29,6 +29,7 @@ class ArtifactStore(Protocol):
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         content: bytes,
         content_type: str | None,
         metadata: Dict[str, object] | None = None,
@@ -41,6 +42,7 @@ class ArtifactStore(Protocol):
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
         payload: object,
     ) -> ArtifactRecord:
@@ -52,6 +54,7 @@ class ArtifactStore(Protocol):
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> object | None:
         """Load a previously stored structured artifact if it exists."""
@@ -62,6 +65,7 @@ class ArtifactStore(Protocol):
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> bool:
         """Return True if the structured artifact exists."""
@@ -80,13 +84,16 @@ class InMemoryArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         content: bytes,
         content_type: str | None,
         metadata: Dict[str, object] | None = None,
     ) -> ArtifactRecord:
-        key = self._key(tenant, job_id, document_id)
+        key = self._key(tenant, knowledge_base_id, job_id, document_id)
         meta = dict(metadata or {})
         meta.setdefault("payload_size", len(content))
+        if knowledge_base_id:
+            meta.setdefault("knowledge_base_id", knowledge_base_id)
         record = ArtifactRecord(
             uri=key,
             content_type=content_type,
@@ -96,8 +103,9 @@ class InMemoryArtifactStore:
         self._store[key] = record
         return record
 
-    def _key(self, tenant: Tenant, job_id: str, document_id: str) -> str:
-        return f"memory://{tenant.org_id}/{tenant.workspace_id}/{job_id}/{document_id}"
+    def _key(self, tenant: Tenant, knowledge_base_id: str | None, job_id: str, document_id: str) -> str:
+        kb = knowledge_base_id or "_default"
+        return f"memory://{kb}/{tenant.org_id}/{tenant.workspace_id}/{job_id}/{document_id}"
 
     def store_json_artifact(
         self,
@@ -105,10 +113,11 @@ class InMemoryArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
         payload: object,
     ) -> ArtifactRecord:
-        key = self._key(tenant, job_id, document_id)
+        key = self._key(tenant, knowledge_base_id, job_id, document_id)
         assets = self._json_assets.setdefault(key, {})
         assets[name] = payload
         record = ArtifactRecord(
@@ -125,9 +134,10 @@ class InMemoryArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> object | None:
-        key = self._key(tenant, job_id, document_id)
+        key = self._key(tenant, knowledge_base_id, job_id, document_id)
         return self._json_assets.get(key, {}).get(name)
 
     def json_artifact_exists(
@@ -136,9 +146,19 @@ class InMemoryArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> bool:
-        return self.load_json_artifact(tenant, job_id=job_id, document_id=document_id, name=name) is not None
+        return (
+            self.load_json_artifact(
+                tenant,
+                job_id=job_id,
+                document_id=document_id,
+                knowledge_base_id=knowledge_base_id,
+                name=name,
+            )
+            is not None
+        )
 
 
 class LocalArtifactStore:
@@ -154,16 +174,19 @@ class LocalArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         content: bytes,
         content_type: str | None,
         metadata: Dict[str, object] | None = None,
     ) -> ArtifactRecord:
-        file_path = self._document_path(tenant, job_id, document_id, content_type)
+        file_path = self._document_path(tenant, knowledge_base_id, job_id, document_id, content_type)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(content)
         stored_at = datetime.now(timezone.utc)
         meta = dict(metadata or {})
         meta.setdefault("payload_size", len(content))
+        if knowledge_base_id:
+            meta.setdefault("knowledge_base_id", knowledge_base_id)
         meta_path = file_path.with_suffix(f"{file_path.suffix}.metadata.json")
         meta_payload = {
             "metadata": meta,
@@ -190,16 +213,26 @@ class LocalArtifactStore:
     def _document_path(
         self,
         tenant: Tenant,
+        knowledge_base_id: str | None,
         job_id: str,
         document_id: str,
         content_type: Optional[str],
     ) -> Path:
-        tenant_path = self._base_path / tenant.org_id / tenant.workspace_id / job_id
+        kb = knowledge_base_id or "_default"
+        tenant_path = self._base_path / kb / tenant.org_id / tenant.workspace_id / job_id
         extension = self._extension_from_type(content_type)
         return tenant_path / f"{document_id}{extension}"
 
-    def _json_path(self, tenant: Tenant, job_id: str, document_id: str, name: str) -> Path:
-        tenant_path = self._base_path / tenant.org_id / tenant.workspace_id / job_id
+    def _json_path(
+        self,
+        tenant: Tenant,
+        knowledge_base_id: str | None,
+        job_id: str,
+        document_id: str,
+        name: str,
+    ) -> Path:
+        kb = knowledge_base_id or "_default"
+        tenant_path = self._base_path / kb / tenant.org_id / tenant.workspace_id / job_id
         tenant_path.mkdir(parents=True, exist_ok=True)
         return tenant_path / f"{document_id}.{name}.json"
 
@@ -209,10 +242,11 @@ class LocalArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
         payload: object,
     ) -> ArtifactRecord:
-        path = self._json_path(tenant, job_id, document_id, name)
+        path = self._json_path(tenant, knowledge_base_id, job_id, document_id, name)
         payload_text = json.dumps(payload, default=_json_default, ensure_ascii=False, indent=2)
         path.write_text(payload_text, encoding="utf-8")
         stored_at = datetime.now(timezone.utc)
@@ -229,9 +263,10 @@ class LocalArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> object | None:
-        path = self._json_path(tenant, job_id, document_id, name)
+        path = self._json_path(tenant, knowledge_base_id, job_id, document_id, name)
         if not path.exists():
             return None
         content = path.read_text(encoding="utf-8")
@@ -259,7 +294,7 @@ class S3ArtifactStore:
         self,
         *,
         bucket: str,
-        prefix: str = "",
+        prefix: str | None = "",
         client: Any | None = None,
         region_name: str | None = None,
         endpoint_url: str | None = None,
@@ -269,12 +304,18 @@ class S3ArtifactStore:
         if client is None:
             try:
                 import boto3  # type: ignore
+                try:
+                    from botocore.config import Config  # type: ignore
+                except Exception:
+                    config = None
+                else:
+                    config = Config(connect_timeout=10, read_timeout=120, retries={"max_attempts": 5, "mode": "standard"})
             except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
                 raise RuntimeError("S3 artifact backend requires 'boto3' to be installed") from exc
-            client = boto3.client("s3", region_name=region_name, endpoint_url=endpoint_url)
+            client = boto3.client("s3", region_name=region_name, endpoint_url=endpoint_url, config=config)
         self._client = client
         self._bucket = bucket
-        self._prefix = prefix.strip("/")
+        self._prefix = (prefix or "").strip("/")
 
     def store_document(
         self,
@@ -282,13 +323,22 @@ class S3ArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         content: bytes,
         content_type: str | None,
         metadata: Dict[str, object] | None = None,
     ) -> ArtifactRecord:
-        key = self._object_key(tenant, job_id, document_id, suffix=self._extension_from_type(content_type))
+        key = self._object_key(
+            tenant,
+            knowledge_base_id,
+            job_id,
+            document_id,
+            suffix=self._extension_from_type(content_type),
+        )
         meta = dict(metadata or {})
         meta.setdefault("payload_size", len(content))
+        if knowledge_base_id:
+            meta.setdefault("knowledge_base_id", knowledge_base_id)
         stored_at = datetime.now(timezone.utc)
         s3_metadata = {
             "artifact-metadata": json.dumps(meta, default=str),
@@ -315,11 +365,20 @@ class S3ArtifactStore:
         }
         return mapping.get(content_type.lower(), ".bin")
 
-    def _object_key(self, tenant: Tenant, job_id: str, document_id: str, *, suffix: str) -> str:
+    def _object_key(
+        self,
+        tenant: Tenant,
+        knowledge_base_id: str | None,
+        job_id: str,
+        document_id: str,
+        *,
+        suffix: str,
+    ) -> str:
+        kb = knowledge_base_id or "_default"
         return "/".join(
             filter(
                 None,
-                [self._prefix, tenant.org_id, tenant.workspace_id, job_id, f"{document_id}{suffix}"],
+                [self._prefix, kb, tenant.org_id, tenant.workspace_id, job_id, f"{document_id}{suffix}"],
             )
         )
 
@@ -329,11 +388,12 @@ class S3ArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
         payload: object,
     ) -> ArtifactRecord:
         body = json.dumps(payload, default=_json_default).encode("utf-8")
-        key = self._object_key(tenant, job_id, document_id, suffix=f".{name}.json")
+        key = self._object_key(tenant, knowledge_base_id, job_id, document_id, suffix=f".{name}.json")
         stored_at = datetime.now(timezone.utc)
         self._client.put_object(
             Bucket=self._bucket,
@@ -355,9 +415,10 @@ class S3ArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> object | None:
-        key = self._object_key(tenant, job_id, document_id, suffix=f".{name}.json")
+        key = self._object_key(tenant, knowledge_base_id, job_id, document_id, suffix=f".{name}.json")
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=key)
         except Exception:  # pragma: no cover - relies on boto3 client
@@ -377,9 +438,10 @@ class S3ArtifactStore:
         *,
         job_id: str,
         document_id: str,
+        knowledge_base_id: str | None,
         name: str,
     ) -> bool:
-        key = self._object_key(tenant, job_id, document_id, suffix=f".{name}.json")
+        key = self._object_key(tenant, knowledge_base_id, job_id, document_id, suffix=f".{name}.json")
         try:
             self._client.head_object(Bucket=self._bucket, Key=key)
             return True

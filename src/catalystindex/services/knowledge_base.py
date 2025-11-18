@@ -159,6 +159,39 @@ class KnowledgeBaseStore:
             return None
         return self._row_to_record(row)
 
+    def update_description(
+        self,
+        tenant: Tenant,
+        knowledge_base_id: str,
+        *,
+        description: str | None = None,
+        keywords: Sequence[str] | None = None,
+    ) -> KnowledgeBaseRecord | None:
+        """Update KB description/keywords."""
+
+        normalized_id = self._normalize_identifier(knowledge_base_id)
+        if not normalized_id:
+            return None
+        updates: dict[str, object] = {}
+        if description is not None:
+            updates["description"] = description
+        if keywords is not None:
+            updates["keywords"] = json.dumps(self._normalize_keywords(keywords))
+        if not updates:
+            return self.get(tenant, normalized_id)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        updates["updated_at"] = now_iso
+        with self._lock:
+            record = self.get(tenant, normalized_id)
+            if not record:
+                return None
+            self._assert_tenant_access(record, tenant)
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            params = list(updates.values()) + [normalized_id]
+            self._execute(f"UPDATE knowledge_bases SET {assignments} WHERE knowledge_base_id = ?", params)
+            self._connection.commit()
+            return self.get(tenant, normalized_id)
+
     def record_document_ingested(
         self,
         tenant: Tenant,
@@ -333,4 +366,3 @@ class KnowledgeBaseStore:
 
 
 __all__ = ["KnowledgeBaseRecord", "KnowledgeBaseStore"]
-

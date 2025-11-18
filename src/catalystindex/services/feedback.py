@@ -167,6 +167,7 @@ class FeedbackService:
         positive: bool,
         comment: str | None = None,
         metadata: Dict[str, object] | None = None,
+        knowledge_base_ids: Iterable[str] | None = None,
     ) -> FeedbackRecord:
         start = perf_counter()
         normalized_chunk_ids = tuple(chunk_id for chunk_id in chunk_ids if chunk_id)
@@ -179,6 +180,7 @@ class FeedbackService:
             query,
             normalized_chunk_ids,
             positive=positive,
+            knowledge_base_ids=tuple(knowledge_base_ids or ()),
         )
         if self._vector_store:
             try:
@@ -186,6 +188,7 @@ class FeedbackService:
                     tenant,
                     normalized_chunk_ids,
                     positive=positive,
+                    knowledge_base_ids=tuple(knowledge_base_ids or ()),
                 )
             except Exception:  # pragma: no cover - defensive guard for optional backends
                 LOGGER.exception("feedback.vector_store_update_failed")

@@ -33,40 +33,12 @@ DEFAULT_POLICY = ChunkingPolicy(
     max_chunk_tokens=500,
     chunk_tiers=("semantic", "window"),
     required_metadata=("policy", "namespace", "section_slug"),
+    llm_metadata=LLMMetadataConfig(enabled=True, model="gpt-4o-mini", summary_length=240, max_terms=8),
 )
 
 
-POLICY_OVERRIDES: Dict[str, ChunkingPolicy] = {
-    "dsm5": ChunkingPolicy(
-        policy_name="dsm5",
-        chunk_modes=("criteria", "highlight", "window"),
-        window_size=360,
-        window_overlap=60,
-        max_chunk_tokens=450,
-        chunk_tiers=("criteria", "semantic", "highlight"),
-        highlight_phrases=("warning", "risk", "suicide"),
-        llm_metadata=LLMMetadataConfig(enabled=True, summary_length=240, max_terms=8),
-    ),
-    "treatment_planner": ChunkingPolicy(
-        policy_name="treatment_planner",
-        chunk_modes=("semantic", "window"),
-        window_size=512,
-        window_overlap=128,
-        max_chunk_tokens=620,
-        chunk_tiers=("semantic", "window"),
-        llm_metadata=LLMMetadataConfig(enabled=True, model="gpt-4o-mini", summary_length=260, max_terms=10),
-    ),
-    "ccbhc": ChunkingPolicy(
-        policy_name="ccbhc",
-        chunk_modes=("section", "window", "semantic"),
-        window_size=480,
-        window_overlap=96,
-        max_chunk_tokens=560,
-        chunk_tiers=("section", "semantic", "window"),
-        highlight_phrases=("staffing", "eligibility", "criteria", "services", "compliance"),
-        llm_metadata=LLMMetadataConfig(enabled=True, summary_length=280, max_terms=12),
-    ),
-}
+# Doc-type-specific policies removed per 2025 best practice; LLM advisor selects per document.
+POLICY_OVERRIDES: Dict[str, ChunkingPolicy] = {}
 
 
 def resolve_policy(policy_name: str | None, fallback: str | None = None) -> ChunkingPolicy:

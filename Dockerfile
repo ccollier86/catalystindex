@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS base
+FROM python:3.11-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -31,9 +31,10 @@ RUN apt-get update && \
 
 COPY . .
 
-RUN pip install --no-cache-dir uv && \
-    rm -rf fastapi pydantic && \
-    uv pip install --system --no-cache -e .[qdrant,openai,workers,redis,ingestion] fastapi uvicorn
+RUN rm -rf pydantic && \
+    pip install --no-cache-dir pydantic==1.10.14 qdrant-client==1.15.1 && \
+    pip install --no-cache-dir cohere && \
+    pip install --no-cache-dir -e .[qdrant,openai,workers,redis,ingestion] uvicorn
 
 EXPOSE 8000
 

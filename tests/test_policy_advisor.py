@@ -8,6 +8,7 @@ from catalystindex.services.ingestion import IngestionService
 from catalystindex.services.ingestion_jobs import DocumentSubmission, IngestionCoordinator, RedisPostgresIngestionJobStore
 from catalystindex.services.knowledge_base import KnowledgeBaseStore
 from catalystindex.services.policy_advisor import PolicyAdvice
+from catalystindex.services.policy_synthesizer import PolicySynthesisResult
 from catalystindex.chunking.engine import ChunkingEngine
 from catalystindex.embeddings.hash import HashEmbeddingProvider
 from catalystindex.parsers.base import ParserAdapter, ParserMetadata
@@ -151,3 +152,57 @@ def test_resolve_ccbhc_policy_template():
     assert "section" in policy.chunk_modes
     assert policy.llm_metadata.enabled is True
     assert policy.window_size == 480
+
+
+def test_policy_synthesizer_applies_overrides():
+    class StubSynth:
+        def synthesize(self, **_: object) -> PolicySynthesisResult:
+            return PolicySynthesisResult(
+                chunk_modes=["window"],
+                window_size=256,
+                window_overlap=64,
+                max_chunk_tokens=512,
+                notes="custom",
+            )
+
+    ingestion = IngestionService(
+        parser_registry=default_registry(),
+        chunking_engine=ChunkingEngine(namespace="advisor-test"),
+        embedding_provider=HashEmbeddingProvider(dimension=32),
+        vector_store=InMemoryVectorStore(),
+        term_index=InMemoryTermIndex(),
+        audit_logger=AuditLogger(),
+        metrics=MetricsRecorder(),
+    )
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    job_store = RedisPostgresIngestionJobStore(connection=connection)
+    kb_store = KnowledgeBaseStore(connection=connection)
+    coordinator = IngestionCoordinator(
+        ingestion_service=ingestion,
+        acquisition=AcquisitionService(),
+        artifact_store=InMemoryArtifactStore(),
+        job_store=job_store,
+        metrics=MetricsRecorder(),
+        audit_logger=AuditLogger(),
+        policy_resolver=resolve_policy,
+        policy_advisor=None,
+        policy_synthesizer=StubSynth(),
+        parser_registry=default_registry(),
+        knowledge_base_store=kb_store,
+    )
+    tenant = Tenant(org_id="org", workspace_id="ws", user_id="u1")
+    submission = DocumentSubmission(
+        document_id="doc-synth",
+        document_title="Ops Report",
+        knowledge_base_id="kb-synth",
+        schema=None,
+        source_type="inline",
+        parser_hint="plain_text",
+        metadata={"content_type": "text/plain"},
+        content="Operational metrics and staffing tables",
+        content_uri=None,
+    )
+    job = coordinator.ingest_document(tenant, submission)
+    document = job.documents[0]
+    assert document.metadata.get("synthesized_policy")

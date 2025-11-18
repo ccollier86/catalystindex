@@ -70,3 +70,4 @@ def test_ingest_and_search_round_trip():
     assert search_resp.status_code == 200, search_resp.text
     search_data = search_resp.json()
     assert search_data["results"], "expected at least one search result after ingestion"
+    first_result = search_data["results"][0]

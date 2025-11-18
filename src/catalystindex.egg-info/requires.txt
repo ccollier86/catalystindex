@@ -10,6 +10,7 @@ python-magic>=0.4.27
 pi-heif>=0.7.0
 pikepdf>=8.15.1
 unstructured[docx,image,pdf,pptx,xlsx]>=0.15.8
+openai>=1.13.3
 
 [openai]
 openai>=1.13.3

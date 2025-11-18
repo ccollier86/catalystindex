@@ -29,6 +29,7 @@ class RQIngestionTaskDispatcher(IngestionTaskDispatcher):
         default_timeout: int = 900,
         max_retries: int = 3,
         retry_intervals: Sequence[int] | None = None,
+        max_queue_length: int | None = None,
     ) -> None:
         missing: list[str] = []
         if redis is None:
@@ -41,6 +42,16 @@ class RQIngestionTaskDispatcher(IngestionTaskDispatcher):
         self._queue = Queue(queue_name, connection=self._redis, default_timeout=default_timeout)
         self._max_retries = max_retries
         self._retry_intervals = tuple(retry_intervals or ())
+        self._max_queue_length = max_queue_length if max_queue_length and max_queue_length > 0 else None
+
+    def can_accept(self, count: int = 1) -> bool:
+        if self._max_queue_length is None:
+            return True
+        try:
+            queued = int(self._queue.count)
+        except Exception:
+            return True
+        return queued + max(count, 0) <= self._max_queue_length
 
     def enqueue(
         self,
@@ -50,6 +61,8 @@ class RQIngestionTaskDispatcher(IngestionTaskDispatcher):
         *,
         retry_intervals: Sequence[int] | None = None,
     ) -> None:
+        if self._max_queue_length is not None and not self.can_accept(1):
+            raise RuntimeError("ingestion queue backpressure: too many queued documents")
         intervals = tuple(retry_intervals or self._retry_intervals)
         retry = None
         if intervals or self._max_retries:
