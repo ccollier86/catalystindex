@@ -1,0 +1,17 @@
+# @package _global_
+# RQ worker disabled (API-only mode)
+
+jobs:
+  worker:
+    enabled: false
+    queue_name: ingestion
+    default_timeout: 900
+    max_retries: 3
+    retry_intervals: [15,30,60,120]
+    max_active_docs: 4
+    max_queue_length: 200
+    llm_batch_size: 8
+    llm_max_workers: 6
+    llm_max_retries: 2
+    llm_retry_delay_base: 0.5
+    llm_max_concurrent_per_batch: 8

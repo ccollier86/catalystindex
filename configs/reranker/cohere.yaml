@@ -1,0 +1,9 @@
+# @package _global_
+# Cohere reranker configuration (using Cohere Rerank API)
+
+reranker:
+  enabled: ${oc.env:CATALYST_RERANKER__enabled,true}
+  provider: cohere
+  model: ${oc.env:CATALYST_RERANKER__model,rerank-english-v3.0}
+  api_key: ${oc.env:COHERE_API_KEY}
+  weight: ${oc.env:CATALYST_RERANKER__weight,0.40}  # Higher weight for dedicated reranker

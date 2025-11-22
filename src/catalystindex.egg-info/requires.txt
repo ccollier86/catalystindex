@@ -1,22 +1,47 @@
+fastapi<0.115
+uvicorn
+pydantic>=2.0.0
+pydantic-settings
+redis>=5.0.0
+rq>=1.15.1
+psycopg[binary]>=3.2.0
+qdrant-client>=1.15.1
+openai>=1.30.0
+tiktoken>=0.8.0
+boto3>=1.35.0
+cohere>=5.0.0
+pdfminer-six>=20221105
+pillow>=11.0.0
+pypdf>=5.0.0
+python-magic>=0.4.27
+pi-heif>=0.20.0
+pikepdf>=9.0.0
+pymupdf>=1.25.0
+unstructured[docx,image,pdf,pptx,xlsx]>=0.16.0
+openparse>=0.7.0
 
 [dev]
 pytest>=8.0.0
 
 [ingestion]
 pdfminer-six>=20221105
-pillow>=10.0.0
-pypdf>=4.0.0
+pillow>=11.0.0
+pypdf>=5.0.0
 python-magic>=0.4.27
-pi-heif>=0.7.0
-pikepdf>=8.15.1
-unstructured[docx,image,pdf,pptx,xlsx]>=0.15.8
-openai>=1.13.3
+pi-heif>=0.20.0
+pikepdf>=9.0.0
+pymupdf>=1.25.0
+unstructured[docx,image,pdf,pptx,xlsx]>=0.16.0
+openparse>=0.7.0
+openai>=1.30.0
+tiktoken>=0.8.0
 
 [openai]
 openai>=1.13.3
+tiktoken>=0.5.0
 
 [qdrant]
-qdrant-client>=1.7.0
+qdrant-client>=1.15.1
 
 [redis]
 redis>=5.0.0

@@ -1,0 +1,9 @@
+# @package _global_
+# OpenAI reranker configuration (using embeddings for reranking)
+
+reranker:
+  enabled: ${oc.env:CATALYST_RERANKER__enabled,true}
+  provider: openai
+  model: ${oc.env:CATALYST_RERANKER__model,text-embedding-3-large}
+  api_key: ${oc.env:OPENAI_API_KEY}
+  weight: ${oc.env:CATALYST_RERANKER__weight,0.35}  # Reranking weight in hybrid scoring

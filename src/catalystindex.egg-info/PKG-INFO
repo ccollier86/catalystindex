@@ -3,29 +3,54 @@ Name: catalystindex
 Version: 0.1.0
 Summary: Catalyst Index RAG platform core services
 Author: Catalyst Index
-Requires-Python: >=3.10
+Requires-Python: >=3.11
 Description-Content-Type: text/markdown
+Requires-Dist: fastapi<0.115
+Requires-Dist: uvicorn
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings
+Requires-Dist: redis>=5.0.0
+Requires-Dist: rq>=1.15.1
+Requires-Dist: psycopg[binary]>=3.2.0
+Requires-Dist: qdrant-client>=1.15.1
+Requires-Dist: openai>=1.30.0
+Requires-Dist: tiktoken>=0.8.0
+Requires-Dist: boto3>=1.35.0
+Requires-Dist: cohere>=5.0.0
+Requires-Dist: pdfminer-six>=20221105
+Requires-Dist: pillow>=11.0.0
+Requires-Dist: pypdf>=5.0.0
+Requires-Dist: python-magic>=0.4.27
+Requires-Dist: pi-heif>=0.20.0
+Requires-Dist: pikepdf>=9.0.0
+Requires-Dist: pymupdf>=1.25.0
+Requires-Dist: unstructured[docx,image,pdf,pptx,xlsx]>=0.16.0
+Requires-Dist: openparse>=0.7.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Provides-Extra: qdrant
-Requires-Dist: qdrant-client>=1.7.0; extra == "qdrant"
+Requires-Dist: qdrant-client>=1.15.1; extra == "qdrant"
 Provides-Extra: redis
 Requires-Dist: redis>=5.0.0; extra == "redis"
 Provides-Extra: openai
 Requires-Dist: openai>=1.13.3; extra == "openai"
+Requires-Dist: tiktoken>=0.5.0; extra == "openai"
 Provides-Extra: workers
 Requires-Dist: rq>=1.15.1; extra == "workers"
 Requires-Dist: redis>=5.0.0; extra == "workers"
 Requires-Dist: psycopg[binary]>=3.1.12; extra == "workers"
 Provides-Extra: ingestion
 Requires-Dist: pdfminer-six>=20221105; extra == "ingestion"
-Requires-Dist: pillow>=10.0.0; extra == "ingestion"
-Requires-Dist: pypdf>=4.0.0; extra == "ingestion"
+Requires-Dist: pillow>=11.0.0; extra == "ingestion"
+Requires-Dist: pypdf>=5.0.0; extra == "ingestion"
 Requires-Dist: python-magic>=0.4.27; extra == "ingestion"
-Requires-Dist: pi-heif>=0.7.0; extra == "ingestion"
-Requires-Dist: pikepdf>=8.15.1; extra == "ingestion"
-Requires-Dist: unstructured[docx,image,pdf,pptx,xlsx]>=0.15.8; extra == "ingestion"
-Requires-Dist: openai>=1.13.3; extra == "ingestion"
+Requires-Dist: pi-heif>=0.20.0; extra == "ingestion"
+Requires-Dist: pikepdf>=9.0.0; extra == "ingestion"
+Requires-Dist: pymupdf>=1.25.0; extra == "ingestion"
+Requires-Dist: unstructured[docx,image,pdf,pptx,xlsx]>=0.16.0; extra == "ingestion"
+Requires-Dist: openparse>=0.7.0; extra == "ingestion"
+Requires-Dist: openai>=1.30.0; extra == "ingestion"
+Requires-Dist: tiktoken>=0.8.0; extra == "ingestion"
 
 # Catalyst Index RAG Platform
 

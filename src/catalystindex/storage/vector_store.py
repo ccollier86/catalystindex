@@ -7,12 +7,23 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
 import uuid
 import requests
 
-from ..models.common import ChunkRecord, RetrievalResult, Tenant
+from ..models.common import ChunkRecord, PageRecord, RetrievalResult, Tenant
 
 
 @dataclass(slots=True)
 class VectorDocument:
     chunk: ChunkRecord
+    vector: Sequence[float]
+    track: str
+    knowledge_base_id: str
+    sparse_vector: Mapping[int, float] | None = None
+
+
+@dataclass(slots=True)
+class PageDocument:
+    """Page-level document for NVIDIA-style context expansion."""
+
+    page: PageRecord
     vector: Sequence[float]
     track: str
     knowledge_base_id: str
@@ -37,6 +48,21 @@ class VectorStoreClient:
     ) -> List[RetrievalResult]:
         raise NotImplementedError
 
+    def upsert_pages(self, tenant: Tenant, pages: Iterable[PageDocument]) -> None:
+        """Store page-level vectors for NVIDIA-style context expansion."""
+        raise NotImplementedError
+
+    def get_pages(
+        self,
+        tenant: Tenant,
+        page_ids: List[str],
+        *,
+        track: str,
+        knowledge_base_id: str,
+    ) -> List[PageRecord]:
+        """Retrieve page records by page IDs."""
+        raise NotImplementedError
+
     def apply_feedback(
         self,
         tenant: Tenant,
@@ -54,6 +80,7 @@ class InMemoryVectorStore(VectorStoreClient):
 
     def __init__(self) -> None:
         self._store: Dict[str, List[VectorDocument]] = {}
+        self._pages: Dict[str, List[PageDocument]] = {}
 
     def _key(self, tenant: Tenant) -> str:
         return f"{tenant.org_id}:{tenant.workspace_id}"
@@ -88,6 +115,40 @@ class InMemoryVectorStore(VectorStoreClient):
             )
         results.sort(key=lambda item: item.score, reverse=True)
         return results[:limit]
+
+    def upsert_pages(self, tenant: Tenant, pages: Iterable[PageDocument]) -> None:
+        """Store page-level documents."""
+        page_docs = self._pages.setdefault(self._key(tenant), [])
+        page_docs.extend(pages)
+
+    def get_pages(
+        self,
+        tenant: Tenant,
+        page_ids: List[str],
+        *,
+        track: str,
+        knowledge_base_id: str,
+    ) -> List[PageRecord]:
+        """Retrieve page records by page IDs."""
+        page_docs = self._pages.get(self._key(tenant), [])
+        if not page_docs:
+            return []
+
+        page_id_set = set(page_ids)
+        results: List[PageRecord] = []
+
+        for page_doc in page_docs:
+            if (
+                page_doc.page.page_id in page_id_set
+                and page_doc.track == track
+                and page_doc.knowledge_base_id == knowledge_base_id
+            ):
+                results.append(page_doc.page)
+
+        # Return in the order of requested page_ids
+        page_map = {page.page_id: page for page in results}
+        ordered_results = [page_map[pid] for pid in page_ids if pid in page_map]
+        return ordered_results
 
     def apply_feedback(
         self,
@@ -211,52 +272,188 @@ class QdrantVectorStore(VectorStoreClient):
     ) -> List[RetrievalResult]:
         filters = dict(filters or {})
         kb_filters = self._extract_kb_filters(filters)
-        aggregated: List[RetrievalResult] = []
-        dense_results: List[RetrievalResult] = []
-        sparse_results: List[RetrievalResult] = []
+        all_results: List[object] = []
+
         for kb_id in kb_filters:
             collection = self._collection_name(track, kb_id)
             if not self._collection_exists(collection):
                 continue
             qdrant_filter = self._build_filter(tenant, track, filters, kb_id)
             search_params = self._rest.SearchParams(exact=False)
-            if self._sparse_enabled:
-                dense_query = self._rest.NamedVector(name="text_dense", vector=vector)
-            else:
-                dense_query = vector
-            dense_kwargs = {
-                "collection_name": collection,
-                "query_vector": dense_query,
-                "query_filter": qdrant_filter,
-                "limit": limit,
-                "search_params": search_params,
-            }
-            dense_results.extend(self._client.search(**dense_kwargs))
 
+            # Server-side RRF fusion if sparse vectors enabled and provided
             if sparse_vector and self._sparse_enabled:
-                sparse_class = getattr(self._rest, "SparseVector", None)
-                named_sparse_class = getattr(self._rest, "NamedSparseVector", None)
-                if sparse_class is None or named_sparse_class is None:
-                    raise RuntimeError("Sparse vector queries require qdrant-client with sparse vector support enabled.")
-                sparse = named_sparse_class(
-                    name="text_sparse",
-                    vector=sparse_class(indices=list(sparse_vector.keys()), values=list(sparse_vector.values())),
+                results = self._query_with_server_side_rrf(
+                    collection=collection,
+                    dense_vector=vector,
+                    sparse_vector=sparse_vector,
+                    qdrant_filter=qdrant_filter,
+                    limit=limit,
+                    search_params=search_params,
                 )
-                sparse_kwargs = {
+                if results is not None:
+                    # Server-side fusion succeeded
+                    all_results.extend(results)
+                else:
+                    # Fallback to client-side fusion
+                    results = self._query_with_client_side_rrf(
+                        collection=collection,
+                        dense_vector=vector,
+                        sparse_vector=sparse_vector,
+                        qdrant_filter=qdrant_filter,
+                        limit=limit,
+                        search_params=search_params,
+                    )
+                    all_results.extend(results)
+            else:
+                # Dense-only query
+                dense_kwargs = {
                     "collection_name": collection,
-                    "query_vector": sparse,
+                    "query": vector,
                     "query_filter": qdrant_filter,
                     "limit": limit,
                     "search_params": search_params,
                 }
-                sparse_results.extend(self._client.search(**sparse_kwargs))
+                if self._sparse_enabled:
+                    dense_kwargs["using"] = "text_dense"
+                all_results.extend(self._client.query_points(**dense_kwargs).points)
 
-        retrievals = self._build_retrievals(dense_results, track) if dense_results else []
-        if sparse_results:
-            sparse_retrievals = self._build_retrievals(sparse_results, track)
-            retrievals = self._rrf_merge(retrievals, sparse_retrievals, limit)
+        retrievals = self._build_retrievals(all_results, track) if all_results else []
         retrievals.sort(key=lambda item: item.score, reverse=True)
         return retrievals[:limit]
+
+    def _query_with_server_side_rrf(
+        self,
+        collection: str,
+        dense_vector: Sequence[float],
+        sparse_vector: Mapping[int, float],
+        qdrant_filter: object,
+        limit: int,
+        search_params: object,
+    ) -> List[object] | None:
+        """Query with server-side RRF fusion using Qdrant Query API.
+
+        Returns list of points if successful, None if server-side fusion not available.
+        """
+        try:
+            # Check for Query API support (Qdrant 1.10+)
+            fusion_class = getattr(self._rest, "Fusion", None)
+            query_class = getattr(self._rest, "Query", None)
+            prefetch_class = getattr(self._rest, "Prefetch", None)
+            sparse_class = getattr(self._rest, "SparseVector", None)
+
+            if not all([fusion_class, query_class, prefetch_class, sparse_class]):
+                # Query API not available, fallback to client-side
+                return None
+
+            # Build sparse vector
+            sparse = sparse_class(
+                indices=list(sparse_vector.keys()),
+                values=list(sparse_vector.values()),
+            )
+
+            # Build prefetch array with dense and sparse queries
+            prefetch = [
+                # Dense query prefetch
+                prefetch_class(
+                    query=dense_vector,
+                    using="text_dense",
+                    filter=qdrant_filter,
+                    limit=limit,
+                ),
+                # Sparse query prefetch
+                prefetch_class(
+                    query=sparse,
+                    using="text_sparse",
+                    filter=qdrant_filter,
+                    limit=limit,
+                ),
+            ]
+
+            # Execute server-side RRF fusion
+            fusion_query = query_class(fusion=fusion_class.RRF)
+            response = self._client.query_points(
+                collection_name=collection,
+                prefetch=prefetch,
+                query=fusion_query,
+                limit=limit,
+                search_params=search_params,
+            )
+
+            return response.points
+
+        except (AttributeError, TypeError, RuntimeError):
+            # Server-side fusion not available or failed
+            return None
+
+    def _query_with_client_side_rrf(
+        self,
+        collection: str,
+        dense_vector: Sequence[float],
+        sparse_vector: Mapping[int, float],
+        qdrant_filter: object,
+        limit: int,
+        search_params: object,
+    ) -> List[object]:
+        """Query with client-side RRF fusion (legacy fallback)."""
+        dense_results: List[object] = []
+        sparse_results: List[object] = []
+
+        # Dense query
+        dense_kwargs = {
+            "collection_name": collection,
+            "query": dense_vector,
+            "using": "text_dense",
+            "query_filter": qdrant_filter,
+            "limit": limit,
+            "search_params": search_params,
+        }
+        dense_results = self._client.query_points(**dense_kwargs).points
+
+        # Sparse query
+        sparse_class = getattr(self._rest, "SparseVector", None)
+        if sparse_class is None:
+            raise RuntimeError("Sparse vector queries require qdrant-client with sparse vector support enabled.")
+        sparse = sparse_class(
+            indices=list(sparse_vector.keys()),
+            values=list(sparse_vector.values()),
+        )
+        sparse_kwargs = {
+            "collection_name": collection,
+            "query": sparse,
+            "using": "text_sparse",
+            "query_filter": qdrant_filter,
+            "limit": limit,
+            "search_params": search_params,
+        }
+        sparse_results = self._client.query_points(**sparse_kwargs).points
+
+        # Client-side RRF merge
+        dense_retrievals = self._build_retrievals(dense_results, "temp") if dense_results else []
+        sparse_retrievals = self._build_retrievals(sparse_results, "temp") if sparse_results else []
+        merged = self._rrf_merge(dense_retrievals, sparse_retrievals, limit)
+
+        # Convert back to point objects (reconstruct from retrievals)
+        # For client-side fusion, we return the original points in merged order
+        chunk_id_to_point = {}
+        for point in dense_results + sparse_results:
+            payload = getattr(point, "payload", {})
+            chunk_payload = payload.get("chunk", {})
+            chunk_id = chunk_payload.get("chunk_id")
+            if chunk_id and chunk_id not in chunk_id_to_point:
+                chunk_id_to_point[chunk_id] = point
+
+        # Reconstruct points in merged order with updated scores
+        merged_points = []
+        for retrieval in merged:
+            chunk_id = retrieval.chunk.chunk_id
+            if chunk_id in chunk_id_to_point:
+                point = chunk_id_to_point[chunk_id]
+                # Update score on point (monkey-patch for consistency)
+                point.score = retrieval.score
+                merged_points.append(point)
+
+        return merged_points
 
     def _build_retrievals(self, results: Sequence[object], track: str) -> List[RetrievalResult]:
         retrievals: List[RetrievalResult] = []
@@ -371,13 +568,109 @@ class QdrantVectorStore(VectorStoreClient):
                     point_ids=[identifier],
                 )
 
+    def upsert_pages(self, tenant: Tenant, pages: Iterable[PageDocument]) -> None:
+        """Store page-level vectors in separate Qdrant collection."""
+        grouped: Dict[tuple[str, str], List[PageDocument]] = defaultdict(list)
+        for page_doc in pages:
+            if not page_doc.knowledge_base_id:
+                raise ValueError("knowledge_base_id is required for page upsert")
+            grouped[(page_doc.track, page_doc.knowledge_base_id)].append(page_doc)
+
+        for (track, kb_id), page_docs in grouped.items():
+            collection = self._page_collection_name(track, kb_id)
+            self._ensure_collection(collection)
+            batch_size = 16
+            use_client_sparse = self._sparse_enabled and self._supports_sparse_vectors
+
+            for start in range(0, len(page_docs), batch_size):
+                batch = page_docs[start : start + batch_size]
+                retries = 3
+                last_error: Exception | None = None
+
+                for attempt in range(1, retries + 1):
+                    try:
+                        if use_client_sparse:
+                            points = [self._build_page_point(tenant, page_doc) for page_doc in batch]
+                            self._client.upsert(collection_name=collection, points=points, wait=True)
+                        else:
+                            self._upsert_pages_via_http(collection, tenant, batch)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < retries:
+                            continue
+                        raise
+
+            if self._defer_indexing:
+                self.finalize_index(collection)
+
+    def get_pages(
+        self,
+        tenant: Tenant,
+        page_ids: List[str],
+        *,
+        track: str,
+        knowledge_base_id: str,
+    ) -> List[PageRecord]:
+        """Retrieve page records by page IDs from Qdrant."""
+        if not page_ids:
+            return []
+
+        collection = self._page_collection_name(track, knowledge_base_id)
+        if not self._collection_exists(collection):
+            return []
+
+        # Build point IDs for pages
+        point_ids = [self._page_point_id(tenant, page_id) for page_id in page_ids]
+
+        try:
+            points = self._client.retrieve(
+                collection_name=collection,
+                ids=point_ids,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            return []
+
+        if not points:
+            return []
+
+        # Extract PageRecords from payloads
+        results: List[PageRecord] = []
+        page_map: Dict[str, PageRecord] = {}
+
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            page_payload = payload.get("page")
+            if not page_payload:
+                continue
+
+            page = PageRecord(**page_payload)
+            page_map[page.page_id] = page
+
+        # Return in requested order
+        results = [page_map[pid] for pid in page_ids if pid in page_map]
+        return results
+
     # Internal helpers -------------------------------------------------
     def _collection_name(self, track: str, knowledge_base_id: str) -> str:
         safe_kb = knowledge_base_id.replace(":", "-")
         return f"{self._collection_prefix}_{track}_{safe_kb}"
 
+    def _page_collection_name(self, track: str, knowledge_base_id: str) -> str:
+        """Get collection name for page-level vectors."""
+        safe_kb = knowledge_base_id.replace(":", "-")
+        return f"{self._collection_prefix}_{track}_{safe_kb}_pages"
+
     def _point_id(self, tenant: Tenant, chunk_id: str) -> str:
         base = f"{tenant.org_id}:{tenant.workspace_id}:{chunk_id}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
+
+    def _page_point_id(self, tenant: Tenant, page_id: str) -> str:
+        """Generate point ID for page record."""
+        base = f"{tenant.org_id}:{tenant.workspace_id}:page:{page_id}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
 
     def _upsert_via_http(self, collection: str, tenant: Tenant, docs: Sequence[VectorDocument]) -> None:
@@ -478,6 +771,44 @@ class QdrantVectorStore(VectorStoreClient):
             create_kwargs["shard_number"] = self._shard_number
         self._client.create_collection(**create_kwargs)
 
+        # Create payload indexes for frequently filtered fields (10-100x speedup)
+        self._create_payload_indexes(collection)
+
+    def _create_payload_indexes(self, collection: str) -> None:
+        """Create payload field indexes for frequently filtered fields.
+
+        Provides 10-100x speedup for filtered queries on tenant, track, kb, tier, etc.
+        """
+        # Index fields that are always filtered (tenant isolation + track)
+        mandatory_indexes = [
+            ("tenant_org", self._rest.PayloadSchemaType.KEYWORD),
+            ("tenant_workspace", self._rest.PayloadSchemaType.KEYWORD),
+            ("track", self._rest.PayloadSchemaType.KEYWORD),
+            ("knowledge_base_id", self._rest.PayloadSchemaType.KEYWORD),
+        ]
+
+        # Index commonly filtered fields (tier, section, policy)
+        common_indexes = [
+            ("chunk_tier", self._rest.PayloadSchemaType.KEYWORD),
+            ("section_slug", self._rest.PayloadSchemaType.KEYWORD),
+            ("policy", self._rest.PayloadSchemaType.KEYWORD),  # When policy-based routing enabled
+        ]
+
+        all_indexes = mandatory_indexes + common_indexes
+
+        for field_name, schema_type in all_indexes:
+            try:
+                self._client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field_name,
+                    field_schema=schema_type,
+                    wait=True,
+                )
+            except Exception:
+                # Index may already exist or field may not be present yet
+                # This is non-fatal - indexes will be created on first insert if needed
+                pass
+
     def finalize_index(self, collection: str) -> None:
         """Re-enable indexing after deferred ingest."""
         if not self._defer_indexing:
@@ -545,6 +876,80 @@ class QdrantVectorStore(VectorStoreClient):
         point_payload = rest.PointStruct(**point_kwargs)  # type: ignore[arg-type]
         return point_payload
 
+    def _build_page_point(self, tenant: Tenant, page_doc: PageDocument):
+        """Build Qdrant point for page-level vector."""
+        from qdrant_client.http import models as rest
+
+        payload = {
+            "tenant_org": tenant.org_id,
+            "tenant_workspace": tenant.workspace_id,
+            "track": page_doc.track,
+            "page": _page_to_payload(page_doc.page),
+            "page_number": page_doc.page.page_number,
+            "document_id": page_doc.page.document_id,
+            "knowledge_base_id": page_doc.knowledge_base_id,
+        }
+
+        point_id = self._page_point_id(tenant, page_doc.page.page_id)
+        vector_payload = {"text_dense": page_doc.vector} if self._sparse_enabled else page_doc.vector
+
+        point_kwargs = {
+            "id": point_id,
+            "vector": vector_payload,
+            "payload": payload,
+        }
+
+        if page_doc.sparse_vector and self._sparse_enabled and self._supports_sparse_vectors:
+            sparse_class = getattr(rest, "SparseVector", None)
+            if sparse_class is None:
+                raise RuntimeError("Sparse vectors requested but qdrant-client does not support them.")
+            sparse_payload = sparse_class(
+                indices=list(page_doc.sparse_vector.keys()),
+                values=list(page_doc.sparse_vector.values()),
+            )
+            point_kwargs["sparse_vectors"] = {"text_sparse": sparse_payload}
+
+        return rest.PointStruct(**point_kwargs)  # type: ignore[arg-type]
+
+    def _upsert_pages_via_http(self, collection: str, tenant: Tenant, page_docs: Sequence[PageDocument]) -> None:
+        """Upsert page documents via HTTP REST API."""
+        if not self._rest_base_url:
+            raise RuntimeError("HTTP upsert requested but no rest_base_url configured.")
+
+        points: List[dict] = []
+        for page_doc in page_docs:
+            vector_payload = {"text_dense": page_doc.vector} if self._sparse_enabled else page_doc.vector
+            point = {
+                "id": self._page_point_id(tenant, page_doc.page.page_id),
+                "vector": vector_payload,
+                "payload": {
+                    "tenant_org": tenant.org_id,
+                    "tenant_workspace": tenant.workspace_id,
+                    "track": page_doc.track,
+                    "page": _page_to_payload(page_doc.page),
+                    "page_number": page_doc.page.page_number,
+                    "document_id": page_doc.page.document_id,
+                    "knowledge_base_id": page_doc.knowledge_base_id,
+                },
+            }
+
+            if page_doc.sparse_vector:
+                point.setdefault("sparse_vectors", {})["text_sparse"] = {
+                    "indices": list(page_doc.sparse_vector.keys()),
+                    "values": list(page_doc.sparse_vector.values()),
+                }
+
+            points.append(point)
+
+        url = f"{self._rest_base_url}/collections/{collection}/points?wait=true"
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["api-key"] = self._api_key
+
+        response = requests.put(url, json={"points": points}, headers=headers, timeout=300)
+        if not response.ok:
+            raise RuntimeError(f"HTTP page upsert failed: {response.status_code} {response.text}")
+
     def _build_filter(
         self,
         tenant: Tenant,
@@ -579,6 +984,16 @@ def _chunk_to_payload(chunk: ChunkRecord) -> Dict[str, object]:
     return payload
 
 
+def _page_to_payload(page: PageRecord) -> Dict[str, object]:
+    """Convert PageRecord to Qdrant payload dict."""
+    from dataclasses import asdict
+
+    payload = asdict(page)
+    payload["metadata"] = dict(page.metadata)
+    payload["chunk_ids"] = list(page.chunk_ids)
+    return payload
+
+
 def _matches_filters(chunk: ChunkRecord, filters: Dict[str, object]) -> bool:
     for key, value in filters.items():
         if key == "chunk_tier":
@@ -605,4 +1020,4 @@ def _norm(vector: Sequence[float]) -> float:
     return math.sqrt(sum(value * value for value in vector))
 
 
-__all__ = ["VectorDocument", "VectorStoreClient", "InMemoryVectorStore", "QdrantVectorStore"]
+__all__ = ["VectorDocument", "PageDocument", "VectorStoreClient", "InMemoryVectorStore", "QdrantVectorStore"]

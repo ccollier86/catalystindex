@@ -1,0 +1,19 @@
+# @package _global_
+# RQ worker configuration (default settings)
+
+jobs:
+  worker:
+    enabled: ${oc.env:CATALYST_JOBS__worker__enabled,true}
+    queue_name: ${oc.env:CATALYST_JOBS__worker__queue_name,ingestion}
+    default_timeout: ${oc.env:CATALYST_JOBS__worker__default_timeout,900}
+    max_retries: ${oc.env:CATALYST_JOBS__worker__max_retries,3}
+    retry_intervals: ${oc.env:CATALYST_JOBS__worker__retry_intervals,[15,30,60,120]}
+    max_active_docs: ${oc.env:CATALYST_JOBS__worker__max_active_docs,4}
+    max_queue_length: ${oc.env:CATALYST_JOBS__worker__max_queue_length,200}
+
+    # LLM enrichment parallel processing (NVIDIA RAG best practices)
+    llm_batch_size: ${oc.env:CATALYST_JOBS__worker__llm_batch_size,8}
+    llm_max_workers: ${oc.env:CATALYST_JOBS__worker__llm_max_workers,6}
+    llm_max_retries: ${oc.env:CATALYST_JOBS__worker__llm_max_retries,2}
+    llm_retry_delay_base: ${oc.env:CATALYST_JOBS__worker__llm_retry_delay_base,0.5}
+    llm_max_concurrent_per_batch: ${oc.env:CATALYST_JOBS__worker__llm_max_concurrent_per_batch,8}

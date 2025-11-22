@@ -1,0 +1,30 @@
+# @package _global_
+# S3 storage configuration (for production artifact storage)
+
+storage:
+  vector_backend: qdrant
+  vector_dimension: 3072
+
+  qdrant:
+    host: ${oc.env:CATALYST_STORAGE__qdrant__host}  # Required
+    port: ${oc.env:CATALYST_STORAGE__qdrant__port,6333}
+    api_key: ${oc.env:CATALYST_STORAGE__qdrant__api_key,}
+    sparse_vectors: true
+    batch_size: 100
+    timeout: 30
+
+  term_index_backend: redis
+  redis:
+    url: ${oc.env:CATALYST_STORAGE__redis__url}  # Required
+    max_connections: 50
+
+  # S3 artifact storage
+  artifacts:
+    backend: s3
+    s3:
+      bucket: ${oc.env:CATALYST_STORAGE__artifacts__s3__bucket}  # Required
+      prefix: ${oc.env:CATALYST_STORAGE__artifacts__s3__prefix,artifacts}
+      region: ${oc.env:CATALYST_STORAGE__artifacts__s3__region,us-east-1}
+      endpoint_url: ${oc.env:CATALYST_STORAGE__artifacts__s3__endpoint_url,}  # Optional for S3-compatible stores
+      access_key_id: ${oc.env:AWS_ACCESS_KEY_ID,}
+      secret_access_key: ${oc.env:AWS_SECRET_ACCESS_KEY,}

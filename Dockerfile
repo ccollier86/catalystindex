@@ -31,9 +31,7 @@ RUN apt-get update && \
 
 COPY . .
 
-RUN rm -rf pydantic && \
-    pip install --no-cache-dir pydantic==1.10.14 qdrant-client==1.15.1 && \
-    pip install --no-cache-dir cohere && \
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -e .[qdrant,openai,workers,redis,ingestion] uvicorn
 
 EXPOSE 8000

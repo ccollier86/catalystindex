@@ -67,7 +67,7 @@ class RQIngestionTaskDispatcher(IngestionTaskDispatcher):
         retry = None
         if intervals or self._max_retries:
             retry = Retry(max(self._max_retries, 0), interval=list(intervals) or None)
-        task_id = f"{job_id}:{submission.document_id}"
+        task_id = f"{job_id}-{submission.document_id}"
         tenant_payload = _serialize_tenant(tenant)
         submission_payload = _serialize_submission(submission)
         self._queue.enqueue(

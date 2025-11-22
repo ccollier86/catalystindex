@@ -27,7 +27,9 @@ class QdrantSettings(BaseModel):
     api_key: str | None = None
     collection_prefix: str = "catalystindex"
     prefer_grpc: bool = False
-    sparse_vectors: bool = False
+    # Hybrid search: Combines dense (semantic) + sparse (keyword) vectors
+    # Leverages qodex-parse metadata (keywords, search_terms) for intelligent weighting
+    sparse_vectors: bool = True  # Qodex-powered hybrid search enabled by default
     # Bulk/index tuning
     hnsw_m: int | None = None
     hnsw_m_final: int | None = None
@@ -70,6 +72,17 @@ class AcquisitionSettings(BaseModel):
     firecrawl: FirecrawlSettings = Field(default_factory=FirecrawlSettings)
 
 
+class ParsingSettings(BaseModel):
+    """Settings for document parsing with OpenParse and other parsers."""
+
+    # OpenParse PDF settings
+    use_openparse_tables: bool = Field(default=True, description="Enable table extraction in PDFs")
+    table_algorithm: str = Field(default="pymupdf", description="Table extraction algorithm: pymupdf | unitable | table-transformers")
+    min_table_confidence: float = Field(default=0.75, description="Minimum confidence threshold for table detection (0.0-1.0)")
+    extract_images: bool = Field(default=True, description="Extract images from PDFs")
+    save_images_as_artifacts: bool = Field(default=False, description="Save extracted images to artifact store (vs base64 in metadata)")
+
+
 class StorageSettings(BaseModel):
     vector_dimension: int = 3072
     premium_max_k: int = 24
@@ -100,22 +113,6 @@ class EmbeddingsSettings(BaseModel):
     )
 
 
-class PolicyAdvisorSettings(BaseModel):
-    enabled: bool = Field(default=False, description="Enable LLM-based policy advising")
-    provider: str = Field(default="openai", description="LLM provider")
-    model: str | None = Field(default="gpt-4o-mini", description="Model used for advising")
-    api_key: str | None = Field(default=None, description="API key for the provider")
-    base_url: str | None = Field(default=None, description="Optional base URL override")
-    sample_chars: int = Field(default=4000, description="How many characters of the document to sample")
-
-
-class PolicySynthesisSettings(BaseModel):
-    enabled: bool = Field(default=False, description="Enable LLM-driven policy synthesis when templates are missing")
-    provider: str = Field(default="openai", description="LLM provider")
-    model: str | None = Field(default="gpt-4o-mini", description="Model used for synthesis")
-    api_key: str | None = Field(default=None, description="API key for the provider")
-    base_url: str | None = Field(default=None, description="Optional base URL override")
-    sample_chars: int = Field(default=4000, description="How many characters to sample for synthesis")
 
 
 class RerankerSettings(BaseModel):
@@ -126,6 +123,41 @@ class RerankerSettings(BaseModel):
     base_url: str | None = Field(default=None, description="Optional base URL override for OpenAI-compatible rerankers")
     top_n: int = Field(default=20, description="Maximum number of documents sent to the reranker")
     weight: float = Field(default=0.3, description="Weight assigned when blending reranker scores")
+
+
+class SemanticCacheSettings(BaseModel):
+    """Redis semantic caching for LLM responses (2025 best practices).
+
+    Reduces LLM costs by 50-70% and improves response times by 4-15x through
+    intelligent caching of semantically similar queries.
+
+    Configuration Guide:
+        - enabled: Set to True to activate semantic caching
+        - redis_url: Dedicated Redis DB recommended (e.g., /2 for cache)
+        - distance_threshold: Lower = stricter (0.1-0.15), higher = more lenient (0.2-0.3)
+        - ttl_seconds: 24 hours default for RAG responses
+
+    Environment Variables:
+        CATALYST_SEMANTIC_CACHE__ENABLED=true
+        CATALYST_SEMANTIC_CACHE__REDIS_URL=redis://localhost:6379/2
+        CATALYST_SEMANTIC_CACHE__DISTANCE_THRESHOLD=0.15
+        CATALYST_SEMANTIC_CACHE__TTL_SECONDS=86400
+    """
+
+    enabled: bool = Field(default=True, description="Enable semantic caching for LLM responses")
+    redis_url: str = Field(
+        default="redis://localhost:6379/2",
+        description="Redis URL for semantic cache (use dedicated DB: /2)",
+    )
+    distance_threshold: float = Field(
+        default=0.15,
+        description="Cosine distance threshold for cache hits (0-1). "
+        "Lower=stricter (0.1-0.15 recommended), higher=more lenient (0.2-0.3)",
+    )
+    ttl_seconds: int = Field(
+        default=86400,
+        description="Cache TTL in seconds (default: 86400 = 24 hours)",
+    )
 
 
 class JobStoreSettings(BaseModel):
@@ -142,6 +174,11 @@ class JobWorkerSettings(BaseModel):
     retry_intervals: List[int] = Field(default_factory=lambda: [15, 30, 60, 120])
     max_active_docs: int = Field(default=4, description="Maximum concurrently running documents per worker")
     max_queue_length: int = Field(default=200, description="Maximum queued documents before backpressure")
+    llm_batch_size: int = Field(default=8, description="Batch size for parallel LLM enrichment (chunks per batch, recommended: 8-16)")
+    llm_max_workers: int | None = Field(default=None, description="Max parallel batch workers for LLM enrichment (None=auto: min(6, chunks/batch_size), recommended: 3-6)")
+    llm_max_retries: int = Field(default=2, description="Retry attempts per chunk during LLM enrichment (recommended: 2)")
+    llm_retry_delay_base: float = Field(default=0.5, description="Base delay (seconds) for exponential backoff during LLM retries")
+    llm_max_concurrent_per_batch: int | None = Field(default=None, description="Max concurrent LLM calls within a batch (None=batch_size, recommended: 4-8 to respect rate limits)")
 
 
 class JobSettings(BaseModel):
@@ -156,8 +193,8 @@ class AppSettings(BaseModel):
     features: FeatureFlags = Field(default_factory=FeatureFlags)
     embeddings: EmbeddingsSettings = Field(default_factory=EmbeddingsSettings)
     reranker: RerankerSettings = Field(default_factory=RerankerSettings)
-    policy_advisor: PolicyAdvisorSettings = Field(default_factory=PolicyAdvisorSettings)
-    policy_synthesis: PolicySynthesisSettings = Field(default_factory=PolicySynthesisSettings)
+    semantic_cache: SemanticCacheSettings = Field(default_factory=SemanticCacheSettings)
+    parsing: ParsingSettings = Field(default_factory=ParsingSettings)
     telemetry_namespace: str = "catalystindex"
     metrics_exporter_port: int | None = 9464
     metrics_exporter_address: str = "0.0.0.0"
@@ -186,17 +223,81 @@ def get_settings() -> AppSettings:
         updates["embeddings"] = EmbeddingsSettings(**settings.embeddings)
     if isinstance(settings.reranker, dict):
         updates["reranker"] = RerankerSettings(**settings.reranker)
-    if isinstance(settings.policy_advisor, dict):
-        updates["policy_advisor"] = PolicyAdvisorSettings(**settings.policy_advisor)
-    if isinstance(settings.policy_synthesis, dict):
-        updates["policy_synthesis"] = PolicySynthesisSettings(**settings.policy_synthesis)
+    if isinstance(settings.semantic_cache, dict):
+        updates["semantic_cache"] = SemanticCacheSettings(**settings.semantic_cache)
     if isinstance(settings.jobs, dict):
         updates["jobs"] = JobSettings(**settings.jobs)
     if isinstance(settings.acquisition, dict):
         updates["acquisition"] = AcquisitionSettings(**settings.acquisition)
+    if isinstance(settings.parsing, dict):
+        updates["parsing"] = ParsingSettings(**settings.parsing)
     if updates:
         settings = settings.model_copy(update=updates)
     return settings
+
+
+def set_settings(settings: AppSettings) -> None:
+    """Programmatically override application settings.
+
+    This function clears the LRU cache and injects new settings,
+    enabling runtime configuration changes for testing and Hydra integration.
+
+    Args:
+        settings: New AppSettings instance to use
+
+    Example:
+        >>> from catalystindex.config.settings import set_settings, AppSettings
+        >>> custom_settings = AppSettings(environment="test")
+        >>> set_settings(custom_settings)
+        >>> get_settings().environment
+        'test'
+
+    Note:
+        This clears the @lru_cache, so subsequent get_settings() calls
+        will return the injected settings instead of loading from env vars.
+    """
+    # Clear the LRU cache
+    get_settings.cache_clear()
+
+    # Replace get_settings with a function that returns the injected settings
+    # We do this by monkey-patching the module's get_settings function
+    import sys
+
+    current_module = sys.modules[__name__]
+
+    # Store original for potential restoration
+    if not hasattr(current_module, "_original_get_settings"):
+        current_module._original_get_settings = get_settings
+
+    # Create new cached function that returns injected settings
+    @lru_cache
+    def _get_injected_settings() -> AppSettings:
+        return settings
+
+    # Replace get_settings in the module
+    current_module.get_settings = _get_injected_settings
+
+
+def reset_settings() -> None:
+    """Reset settings to default environment-based loading.
+
+    Clears any programmatically injected settings and restores
+    the original environment variable-based configuration loading.
+
+    Example:
+        >>> reset_settings()
+        >>> get_settings()  # Now loads from environment variables again
+    """
+    import sys
+
+    current_module = sys.modules[__name__]
+
+    if hasattr(current_module, "_original_get_settings"):
+        # Restore original get_settings
+        get_settings.cache_clear()
+        current_module.get_settings = current_module._original_get_settings
+        current_module.get_settings.cache_clear()
+        delattr(current_module, "_original_get_settings")
 
 
 def _load_env_overrides(prefix: str = "CATALYST_") -> dict:
@@ -242,4 +343,13 @@ def _coerce_env_value(value: str):
     return value
 
 
-__all__ = ["AppSettings", "get_settings"]
+# Alias for Hydra compatibility
+Settings = AppSettings
+
+__all__ = [
+    "AppSettings",
+    "Settings",  # Alias for Hydra integration
+    "get_settings",
+    "set_settings",
+    "reset_settings",
+]

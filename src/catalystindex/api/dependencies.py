@@ -27,11 +27,11 @@ from ..services.ingestion_jobs import (
     RedisPostgresIngestionJobStore,
 )
 from ..services.knowledge_base import KnowledgeBaseStore
-from ..services.policy_advisor import PolicyAdvisor, PolicyAdvice
-from ..services.policy_synthesizer import LLMPolicySynthesizer, PolicySynthesizer
 from ..services.workload import WorkloadLimiter
 from ..workers.dispatcher import RQIngestionTaskDispatcher
 from ..services.search import CohereReranker, EmbeddingReranker, OpenAIReranker, SearchService
+from ..services.semantic_cache import SemanticCache
+from ..sparse.qodex_generator import QodexSparseGenerator
 from ..storage.term_index import InMemoryTermIndex, RedisTermIndex, TermIndex
 from ..storage.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStoreClient
 from ..telemetry.logger import AuditLogger, MetricsRecorder
@@ -180,6 +180,33 @@ def get_chunking_engine() -> ChunkingEngine:
 
 
 @lru_cache
+def get_semantic_cache() -> SemanticCache | None:
+    """Create semantic cache for LLM response caching.
+
+    Returns None if cache is disabled or unavailable (graceful degradation).
+    """
+    settings = get_settings()
+    cache_settings = settings.semantic_cache
+
+    if not cache_settings.enabled:
+        return None
+
+    try:
+        return SemanticCache(
+            redis_url=cache_settings.redis_url,
+            embedding_provider=get_embedding_provider(),
+            distance_threshold=cache_settings.distance_threshold,
+            ttl_seconds=cache_settings.ttl_seconds,
+        )
+    except Exception as e:
+        LOGGER.warning(
+            "semantic_cache.init_failed",
+            extra={"error": str(e), "message": "Semantic cache disabled due to initialization failure"},
+        )
+        return None
+
+
+@lru_cache
 def get_parser_registry():
     return default_registry()
 
@@ -272,7 +299,10 @@ def get_ingestion_job_store() -> IngestionJobStore:
 
 @lru_cache
 def get_knowledge_base_store() -> KnowledgeBaseStore:
-    return KnowledgeBaseStore(connection=get_job_store_connection())
+    return KnowledgeBaseStore(
+        connection=get_job_store_connection(),
+        audit_logger=get_audit_logger(),
+    )
 
 
 @lru_cache
@@ -324,6 +354,14 @@ def get_acquisition_service() -> AcquisitionService:
 
 def get_ingestion_service() -> IngestionService:
     settings = get_settings()
+    # Instantiate qodex-aware sparse vector generator if sparse vectors are enabled
+    sparse_generator = None
+    if settings.storage.qdrant.sparse_vectors:
+        sparse_generator = QodexSparseGenerator(
+            search_term_weight=2.0,  # Query-optimized terms get highest weight
+            keyword_weight=1.5,      # LLM-extracted keywords get medium weight
+            text_weight=1.0,         # Text tokens get baseline weight
+        )
     return IngestionService(
         parser_registry=get_parser_registry(),
         chunking_engine=get_chunking_engine(),
@@ -333,6 +371,12 @@ def get_ingestion_service() -> IngestionService:
         audit_logger=get_audit_logger(),
         metrics=get_metrics(),
         enable_sparse_vectors=settings.storage.qdrant.sparse_vectors,
+        sparse_generator=sparse_generator,
+        llm_batch_size=settings.jobs.worker.llm_batch_size,
+        llm_max_workers=settings.jobs.worker.llm_max_workers,
+        llm_max_retries=settings.jobs.worker.llm_max_retries,
+        llm_retry_delay_base=settings.jobs.worker.llm_retry_delay_base,
+        llm_max_concurrent_per_batch=settings.jobs.worker.llm_max_concurrent_per_batch,
     )
 
 
@@ -349,54 +393,14 @@ def get_ingestion_coordinator() -> IngestionCoordinator:
         policy_resolver=resolve_policy,
         task_dispatcher=get_ingestion_task_dispatcher(),
         retry_intervals=settings.jobs.worker.retry_intervals,
-        policy_advisor=get_policy_advisor(),
-        policy_synthesizer=get_policy_synthesizer(),
         parser_registry=get_parser_registry(),
         knowledge_base_store=get_knowledge_base_store(),
         workload_limiter=get_workload_limiter(),
     )
 
 
-@lru_cache
-def get_policy_advisor() -> PolicyAdvisor | None:
-    settings = get_settings()
-    advisor_settings = settings.policy_advisor
-    if not advisor_settings.enabled:
-        return None
-    api_key = advisor_settings.api_key or os.getenv("CATALYST_POLICY_ADVISOR__api_key") or os.getenv("OPENAI_API_KEY")
-    try:
-        return PolicyAdvisor(
-            enabled=advisor_settings.enabled,
-            provider=advisor_settings.provider,
-            model=advisor_settings.model or "gpt-4o-mini",
-            api_key=api_key,
-            base_url=advisor_settings.base_url,
-            sample_chars=advisor_settings.sample_chars,
-        )
-    except RuntimeError as exc:
-        LOGGER.warning("policy_advisor.disabled", extra={"error": str(exc)})
-        return None
 
 
-@lru_cache
-def get_policy_synthesizer() -> PolicySynthesizer | None:
-    settings = get_settings()
-    cfg = settings.policy_synthesis
-    if not cfg.enabled:
-        return None
-    api_key = cfg.api_key or os.getenv("CATALYST_POLICY_SYNTHESIS__api_key") or os.getenv("OPENAI_API_KEY")
-    try:
-        return LLMPolicySynthesizer(
-            enabled=cfg.enabled,
-            provider=cfg.provider,
-            model=cfg.model or "gpt-4o-mini",
-            api_key=api_key,
-            base_url=cfg.base_url,
-            sample_chars=cfg.sample_chars,
-        )
-    except RuntimeError as exc:
-        LOGGER.warning("policy_synthesizer.disabled", extra={"error": str(exc)})
-        return None
 
 
 def _build_reranker(settings, embedding_provider):
@@ -442,6 +446,16 @@ def get_search_service() -> SearchService:
     settings = get_settings()
     embedding_provider = get_embedding_provider()
     reranker = _build_reranker(settings, embedding_provider)
+
+    # Sparse generator for hybrid search (matches ingestion sparse generation)
+    sparse_generator = None
+    if settings.storage.qdrant.sparse_vectors:
+        sparse_generator = QodexSparseGenerator(
+            search_term_weight=2.0,
+            keyword_weight=1.5,
+            text_weight=1.0,
+        )
+
     return SearchService(
         embedding_provider=embedding_provider,
         vector_store=get_vector_store(),
@@ -454,6 +468,7 @@ def get_search_service() -> SearchService:
         enable_sparse_queries=settings.storage.qdrant.sparse_vectors,
         premium_rerank_enabled=settings.features.enable_premium_rerank,
         feedback_weight=settings.features.search_feedback_weight,
+        sparse_generator=sparse_generator,
     )
 
 
@@ -462,6 +477,7 @@ def get_generation_service() -> GenerationService:
         search_service=get_search_service(),
         metrics=get_metrics(),
         audit_logger=get_audit_logger(),
+        semantic_cache=get_semantic_cache(),
     )
 
 

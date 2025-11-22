@@ -1,0 +1,42 @@
+# @package _global_
+# Staging environment configuration (production-like)
+
+environment: staging
+
+security:
+  jwt_secret: ${oc.env:CATALYST_SECURITY__jwt_secret}  # Required from env
+
+api:
+  host: 0.0.0.0
+  port: 8888
+  reload: false
+  workers: 2
+
+features:
+  enable_metrics: true
+  enable_firecrawl: true
+
+storage:
+  vector_backend: qdrant
+  qdrant:
+    sparse_vectors: true
+  term_index_backend: redis
+
+embeddings:
+  allow_hash_fallback: false  # Strict validation in staging
+
+reranker:
+  enabled: true
+  weight: 0.35
+
+semantic_cache:
+  enabled: true
+  distance_threshold: 0.15
+  ttl_seconds: 43200  # 12 hours in staging
+
+workers:
+  enabled: true
+  max_active_docs: 4
+  max_queue_length: 100
+  llm_batch_size: 8
+  llm_max_workers: 4

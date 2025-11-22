@@ -1,40 +1,31 @@
+# Docker Compose for Catalyst Index with Hydra Configuration
+#
+# This file uses Hydra for composable configuration management.
+# Configuration is managed through YAML files with CLI overrides.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+
 version: "3.9"
 
 services:
   api:
     build:
       context: ..
+    command:
+      - python
+      - -m
+      - catalystindex.main
     env_file:
       - ../.env
     environment:
-      CATALYST_ENVIRONMENT: dev
-      CATALYST_STORAGE__vector_backend: qdrant
-      CATALYST_STORAGE__qdrant__host: qdrant
-      CATALYST_STORAGE__qdrant__port: 6333
-      CATALYST_STORAGE__qdrant__sparse_vectors: ${CATALYST_STORAGE__qdrant__sparse_vectors:-true}
-      CATALYST_STORAGE__term_index_backend: redis
-      CATALYST_STORAGE__redis__url: redis://redis:6379/0
-      CATALYST_STORAGE__artifacts__backend: ${CATALYST_STORAGE__artifacts__backend:-s3}
-      CATALYST_STORAGE__artifacts__base_path: /data/artifacts
-      CATALYST_STORAGE__artifacts__local__base_path: ${CATALYST_STORAGE__artifacts__local__base_path:-/data/artifacts}
-      CATALYST_STORAGE__artifacts__s3__bucket: ${CATALYST_STORAGE__artifacts__s3__bucket:-catalyst-index--use1-az4--xa-s3}
-      CATALYST_STORAGE__artifacts__s3__prefix: ${CATALYST_STORAGE__artifacts__s3__prefix:-}
-      CATALYST_STORAGE__artifacts__s3__region: ${CATALYST_STORAGE__artifacts__s3__region:-us-east-1}
-      CATALYST_JOBS__store__redis_url: redis://redis:6379/1
-      CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
-      CATALYST_JOBS__worker__enabled: "true"
-      CATALYST_JOBS__worker__queue_name: ingestion
-      CATALYST_JOBS__worker__max_active_docs: 4
-      CATALYST_JOBS__worker__max_queue_length: 200
-      CATALYST_EMBEDDINGS__provider: ${CATALYST_EMBEDDINGS__provider:-openai}
-      CATALYST_EMBEDDINGS__allow_hash_fallback: ${CATALYST_EMBEDDINGS__allow_hash_fallback:-false}
-      CATALYST_RERANKER__enabled: ${CATALYST_RERANKER__enabled:-true}
-      CATALYST_RERANKER__provider: ${CATALYST_RERANKER__provider:-cohere}
-      CATALYST_RERANKER__model: ${CATALYST_RERANKER__model:-rerank-v3.5}
-      CATALYST_POLICY_ADVISOR__enabled: ${CATALYST_POLICY_ADVISOR__enabled:-true}
-      CATALYST_POLICY_SYNTHESIS__enabled: ${CATALYST_POLICY_SYNTHESIS__enabled:-true}
-      CATALYST_FEATURES__enable_metrics: "false"
-      CATALYST_METRICS_EXPORTER_PORT: 9464
+      # Only secrets and API keys - config comes from Hydra
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      CATALYST_SECURITY__jwt_secret: ${CATALYST_SECURITY__jwt_secret:-dev-secret-change-me}
     ports:
       - "18888:8000"
     depends_on:
@@ -42,48 +33,29 @@ services:
       - redis
       - qdrant
     volumes:
+      - ../configs:/app/configs:ro
       - artifacts_data:/data/artifacts
 
   worker:
     build:
       context: ..
-    command: ["python", "scripts/run_worker.py"]
+    command:
+      - python
+      - scripts/run_worker.py
     env_file:
       - ../.env
     environment:
-      CATALYST_ENVIRONMENT: dev
-      CATALYST_STORAGE__vector_backend: qdrant
-      CATALYST_STORAGE__qdrant__host: qdrant
-      CATALYST_STORAGE__qdrant__port: 6333
-      CATALYST_STORAGE__qdrant__sparse_vectors: ${CATALYST_STORAGE__qdrant__sparse_vectors:-true}
-      CATALYST_STORAGE__term_index_backend: redis
-      CATALYST_STORAGE__redis__url: redis://redis:6379/0
-      CATALYST_STORAGE__artifacts__backend: ${CATALYST_STORAGE__artifacts__backend:-s3}
-      CATALYST_STORAGE__artifacts__base_path: /data/artifacts
-      CATALYST_STORAGE__artifacts__local__base_path: ${CATALYST_STORAGE__artifacts__local__base_path:-/data/artifacts}
-      CATALYST_STORAGE__artifacts__s3__bucket: ${CATALYST_STORAGE__artifacts__s3__bucket:-catalyst-index--use1-az4--xa-s3}
-      CATALYST_STORAGE__artifacts__s3__prefix: ${CATALYST_STORAGE__artifacts__s3__prefix:-}
-      CATALYST_STORAGE__artifacts__s3__region: ${CATALYST_STORAGE__artifacts__s3__region:-us-east-1}
-      CATALYST_JOBS__store__redis_url: redis://redis:6379/1
-      CATALYST_JOBS__store__postgres_dsn: postgresql://catalyst:catalyst@postgres:5432/catalystjobs
-      CATALYST_JOBS__worker__queue_name: ingestion
-      CATALYST_JOBS__worker__enabled: "true"
-      CATALYST_JOBS__worker__max_active_docs: 4
-      CATALYST_JOBS__worker__max_queue_length: 200
-      CATALYST_EMBEDDINGS__provider: ${CATALYST_EMBEDDINGS__provider:-openai}
-      CATALYST_EMBEDDINGS__allow_hash_fallback: ${CATALYST_EMBEDDINGS__allow_hash_fallback:-false}
-      CATALYST_RERANKER__enabled: ${CATALYST_RERANKER__enabled:-true}
-      CATALYST_RERANKER__provider: ${CATALYST_RERANKER__provider:-cohere}
-      CATALYST_RERANKER__model: ${CATALYST_RERANKER__model:-rerank-v3.5}
-      CATALYST_POLICY_ADVISOR__enabled: ${CATALYST_POLICY_ADVISOR__enabled:-false}
-      CATALYST_POLICY_SYNTHESIS__enabled: ${CATALYST_POLICY_SYNTHESIS__enabled:-false}
-      CATALYST_FEATURES__enable_metrics: "false"
-      CATALYST_METRICS_EXPORTER_PORT: 9464
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     depends_on:
       - postgres
       - redis
       - qdrant
     volumes:
+      - ../configs:/app/configs:ro
       - artifacts_data:/data/artifacts
 
   postgres:

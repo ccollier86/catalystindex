@@ -1,0 +1,43 @@
+# @package _global_
+# Development environment configuration
+
+environment: dev
+
+security:
+  jwt_secret: ${oc.env:CATALYST_SECURITY__jwt_secret,dev-secret-change-me}
+
+api:
+  host: 0.0.0.0
+  port: 8888
+  reload: true
+  workers: 1
+
+features:
+  enable_metrics: true
+  enable_firecrawl: false
+
+# Relaxed settings for development
+storage:
+  vector_backend: qdrant
+  qdrant:
+    sparse_vectors: true  # Enable hybrid search
+  term_index_backend: redis
+
+embeddings:
+  allow_hash_fallback: true  # Allow fallback in dev
+
+reranker:
+  enabled: true
+  weight: 0.35
+
+semantic_cache:
+  enabled: true
+  distance_threshold: 0.15
+  ttl_seconds: 3600  # 1 hour in dev (faster iteration)
+
+workers:
+  enabled: true
+  max_active_docs: 2  # Lower for dev
+  max_queue_length: 50
+  llm_batch_size: 4  # Smaller batches for dev
+  llm_max_workers: 2

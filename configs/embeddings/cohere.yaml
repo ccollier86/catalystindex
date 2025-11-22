@@ -1,0 +1,11 @@
+# @package _global_
+# Cohere embeddings configuration
+
+embeddings:
+  provider: cohere
+  model: ${oc.env:CATALYST_EMBEDDINGS__model,embed-english-v3.0}
+  api_key: ${oc.env:COHERE_API_KEY}  # Required
+  allow_hash_fallback: ${oc.env:CATALYST_EMBEDDINGS__allow_hash_fallback,false}
+  batch_size: ${oc.env:CATALYST_EMBEDDINGS__batch_size,96}
+  timeout: ${oc.env:CATALYST_EMBEDDINGS__timeout,30}
+  input_type: search_document  # Cohere-specific: search_document or search_query

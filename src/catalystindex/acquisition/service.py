@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import mimetypes
 from dataclasses import dataclass
 from typing import Dict, Optional, Protocol, runtime_checkable
@@ -8,6 +9,8 @@ try:  # pragma: no cover - optional dependency
     import magic  # type: ignore
 except Exception:  # pragma: no cover
     magic = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -55,16 +58,33 @@ class AcquisitionService:
         if normalized_type in {"inline", "upload"}:
             if content is None:
                 raise ValueError("Inline or upload sources must include content")
-            payload = content.encode("utf-8") if isinstance(content, str) else content
+
+            # Handle base64-encoded content (common for API uploads)
+            if isinstance(content, str):
+                payload, was_base64 = self._decode_if_base64(content)
+                if was_base64:
+                    logger.info(f"Decoded base64 content ({len(content)} chars → {len(payload)} bytes)")
+                else:
+                    payload = content.encode("utf-8")
+            else:
+                payload = content
+                was_base64 = False
+
             metadata.setdefault("source_type", normalized_type)
             name_hint = self._preferred_name(metadata)
-            content_type = metadata.get("content_type") or self._detect_content_type(
-                payload,
-                metadata,
-                source_hint=name_hint,
-            )
+
+            # Use provided content_type if available, otherwise detect
+            provided_content_type = metadata.get("content_type")
+            if provided_content_type and isinstance(provided_content_type, str):
+                logger.info(f"Using provided content_type: {provided_content_type}")
+                content_type = str(provided_content_type)  # Ensure it's a string
+            else:
+                content_type = self._detect_content_type(payload, metadata, source_hint=name_hint)
+                logger.info(f"Detected content_type: {content_type} (base64={was_base64}, size={len(payload)} bytes)")
+
             metadata.setdefault("content_type", content_type)
             inferred_parser = parser_hint or self._parser_hint_from_content_type(content_type)
+            logger.info(f"Acquisition: content_type='{content_type}', parser_hint='{inferred_parser}', source={normalized_type}")
             return AcquisitionResult(
                 content=payload,
                 content_type=content_type,
@@ -251,6 +271,62 @@ class AcquisitionService:
         if lowered.startswith("text/"):
             return "plain_text"
         return None
+
+    def _decode_if_base64(self, content: str) -> tuple[bytes, bool]:
+        """
+        Attempt to decode content as base64.
+
+        Returns:
+            (decoded_bytes, was_base64) - decoded bytes and whether it was base64
+
+        If content is base64-encoded binary data (PDF, DOCX, etc.), decode it.
+        Otherwise, return content as UTF-8 bytes.
+        """
+        import base64
+
+        # Quick heuristic: base64 typically has no newlines/spaces and uses base64 chars
+        # Real documents are usually much larger when base64-encoded
+        stripped = content.strip()
+        if len(stripped) < 100:
+            # Too short to be a base64-encoded document
+            return content.encode("utf-8"), False
+
+        # Check if it looks like base64: only contains base64 characters
+        base64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        # Allow some whitespace that might be present
+        sample = stripped[:1000].replace("\n", "").replace("\r", "").replace(" ", "")
+        if not all(c in base64_chars for c in sample):
+            # Contains non-base64 characters
+            return content.encode("utf-8"), False
+
+        # Try to decode
+        try:
+            decoded = base64.b64decode(stripped, validate=True)
+
+            # Check if decoded data looks like binary format (PDF, Office docs, etc.)
+            # by checking magic bytes
+            if decoded.startswith(b"%PDF-"):
+                logger.debug("Detected base64-encoded PDF")
+                return decoded, True
+            elif decoded.startswith(b"PK\x03\x04"):
+                logger.debug("Detected base64-encoded ZIP/Office document")
+                return decoded, True
+            elif decoded[:4] in (b"\xD0\xCF\x11\xE0", b"\x50\x4B\x03\x04"):
+                logger.debug("Detected base64-encoded Office document (legacy)")
+                return decoded, True
+            else:
+                # Decoded but doesn't look like a document format we recognize
+                # Might be text that happened to be valid base64
+                logger.debug(f"Decoded as base64 but unrecognized format (first 16 bytes: {decoded[:16].hex()})")
+                # If it decoded and is significantly different in size, trust it
+                if len(decoded) < len(content) * 0.5:  # base64 is ~133% of original
+                    return decoded, True
+                return content.encode("utf-8"), False
+
+        except Exception as e:
+            # Not valid base64 or decode failed
+            logger.debug(f"Base64 decode failed: {e}")
+            return content.encode("utf-8"), False
 
 
 __all__ = ["AcquisitionResult", "AcquisitionService", "URLFetcher"]

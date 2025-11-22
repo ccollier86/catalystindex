@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any, Iterable, List, Sequence
 
 from ..models.common import Tenant
+from ..telemetry.logger import AuditLogger
 
 
 @dataclass(slots=True)
@@ -30,9 +31,16 @@ class KnowledgeBaseRecord:
 class KnowledgeBaseStore:
     """Persistence layer for knowledge base catalog entries."""
 
-    def __init__(self, *, connection: Any, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        connection: Any,
+        logger: logging.Logger | None = None,
+        audit_logger: AuditLogger | None = None,
+    ) -> None:
         self._connection = connection
         self._logger = logger or logging.getLogger(__name__)
+        self._audit_logger = audit_logger
         self._lock = RLock()
         module_name = type(connection).__module__
         self._placeholder = "%s" if "psycopg" in module_name else "?"
@@ -85,6 +93,14 @@ class KnowledgeBaseStore:
                         keywords=json.loads(updates.get("keywords", json.dumps(record.keywords))),
                         updated_at=datetime.fromisoformat(now_iso),
                     )
+                    # Audit log KB update
+                    if self._audit_logger:
+                        self._audit_logger.knowledge_base_updated(
+                            tenant,
+                            knowledge_base_id=normalized_id,
+                            description=description,
+                            keywords=list(keywords) if keywords else None,
+                        )
                 return record
 
             keywords_payload = json.dumps(self._normalize_keywords(keywords))
@@ -115,6 +131,16 @@ class KnowledgeBaseStore:
                 ),
             )
             self._connection.commit()
+
+            # Audit log KB creation
+            if self._audit_logger:
+                self._audit_logger.knowledge_base_created(
+                    tenant,
+                    knowledge_base_id=normalized_id,
+                    description=description,
+                    keywords=list(keywords) if keywords else None,
+                )
+
             return KnowledgeBaseRecord(
                 knowledge_base_id=normalized_id,
                 org_id=tenant.org_id,

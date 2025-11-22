@@ -10,6 +10,9 @@ from .base import (
     PlainTextParser,
 )
 from .unstructured_adapter import UNSTRUCTURED_PARSER_METADATA, UnstructuredParserAdapter
+from .qodex_adapter import QODEX_PARSER_METADATA, QodexParserAdapter
+# Keep OpenParse available for backwards compatibility (deprecated)
+from .openparse_adapter import OPENPARSE_PARSER_METADATA, OpenParseAdapter
 
 
 class ParserRegistry:
@@ -57,18 +60,22 @@ def default_registry() -> ParserRegistry:
             description="HTML parser that sanitizes DOM fetched via Firecrawl/Playwright",
         ),
     )
+    # Use Qodex-Parse for PDF parsing (universal + modern)
+    # IMPORTANT: Use mode="full" for enhanced metadata (keywords, search_terms, semantic neighbors)
+    import os
+    qodex_adapter = QodexParserAdapter(
+        mode="full",  # Full mode with LLM-powered metadata
+        openai_key=os.getenv("OPENAI_API_KEY"),
+    )
+    registry.register("pdf", qodex_adapter, metadata=QODEX_PARSER_METADATA)
+
+    # Keep OpenParse available for backwards compatibility (deprecated)
+    openparse_adapter = OpenParseAdapter()
+    registry.register("openparse", openparse_adapter, metadata=OPENPARSE_PARSER_METADATA)
+
+    # Keep unstructured for other formats
     unstructured_adapter = UnstructuredParserAdapter()
     registry.register("unstructured", unstructured_adapter, metadata=UNSTRUCTURED_PARSER_METADATA)
-    registry.register(
-        "pdf",
-        unstructured_adapter,
-        metadata=ParserMetadata(
-            name="pdf",
-            content_types=("application/pdf",),
-            requires=("unstructured",),
-            description="PDF parser powered by unstructured.partition.auto",
-        ),
-    )
     registry.register(
         "docx",
         UnstructuredParserAdapter(strategy="fast"),

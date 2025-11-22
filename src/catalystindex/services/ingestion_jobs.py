@@ -13,14 +13,12 @@ from uuid import uuid4
 
 from ..acquisition.service import AcquisitionService
 from ..artifacts.store import ArtifactStore
-from ..models.common import ChunkRecord, Tenant
+from ..models.common import ChunkRecord, SectionText, Tenant
 from ..parsers.registry import ParserRegistry, default_registry
 from ..policies.resolver import ChunkingPolicy
 from ..telemetry.logger import AuditLogger, MetricsRecorder
 from .ingestion import IngestionService
 from .knowledge_base import KnowledgeBaseStore
-from .policy_advisor import PolicyAdvisor, PolicyAdvice
-from .policy_synthesizer import PolicySynthesizer, PolicySynthesisResult
 from .workload import WorkloadLimiter
 
 
@@ -43,6 +41,7 @@ DOCUMENT_STAGE_SEQUENCE: tuple[str, ...] = (
     "acquired",
     "parsed",
     "chunked",
+    "enriched",  # LLM metadata enrichment stage
     "embedded",
     "uploaded",
 )
@@ -60,6 +59,7 @@ class DocumentSubmission:
     content: bytes | str | None
     content_uri: str | None
     force_reprocess: bool = False
+    skip_llm_policy: bool = False  # If True, bypass LLM and use schema/default policy
 
 
 @dataclass(slots=True)
@@ -801,8 +801,6 @@ class IngestionCoordinator:
         policy_resolver,
         task_dispatcher: IngestionTaskDispatcher | None = None,
         retry_intervals: Sequence[int] | None = None,
-        policy_advisor: PolicyAdvisor | None = None,
-        policy_synthesizer: "PolicySynthesizer" | None = None,
         parser_registry: ParserRegistry | None = None,
         knowledge_base_store: KnowledgeBaseStore | None = None,
         workload_limiter: WorkloadLimiter | None = None,
@@ -818,8 +816,6 @@ class IngestionCoordinator:
         self._resolve_policy = policy_resolver
         self._task_dispatcher = task_dispatcher
         self._retry_intervals = tuple(retry_intervals or (15, 30, 60, 120))
-        self._policy_advisor = policy_advisor
-        self._policy_synthesizer = policy_synthesizer
         self._parser_registry = parser_registry or default_registry()
         self._default_parser = "plain_text"
         self._logger = logging.getLogger(__name__)
@@ -913,8 +909,33 @@ class IngestionCoordinator:
             ("mime", self._infer_parser_from_content_type(content_type)),
             ("default", self._default_parser),
         ]
+
+        # Log all candidates for debugging
+        self._logger.info(
+            "parser.selection.candidates",
+            extra={
+                "document_id": submission.document_id,
+                "candidates": {
+                    "submission": submission.parser_hint,
+                    "advisor": advisor_parser_hint,
+                    "acquisition": acquisition_parser_hint,
+                    "mime_from_content_type": self._infer_parser_from_content_type(content_type),
+                    "content_type": content_type,
+                    "default": self._default_parser,
+                },
+            },
+        )
+
         for source, parser_name in candidates:
             if parser_name:
+                self._logger.info(
+                    "parser.selection.selected",
+                    extra={
+                        "document_id": submission.document_id,
+                        "source": source,
+                        "parser": parser_name,
+                    },
+                )
                 if source not in {"submission", "advisor"}:
                     self._logger.warning(
                         "parser.selection.fallback",
@@ -996,70 +1017,37 @@ class IngestionCoordinator:
                 content_type=acquisition.content_type,
                 metadata=acquisition.metadata,
             )
-            advisor_policy = None
-            advisor_parser_hint = None
-            advisor_overrides: Dict[str, object] = {}
-            advisor_metadata: Dict[str, object] = {}
-            if self._policy_advisor and not submission.schema:
-                preview = self._preview_text(acquisition.content)
-                advice = self._policy_advisor.advise(
-                    title=submission.document_title,
-                    schema=submission.schema,
-                    content=preview,
-                )
-                if advice.policy_name:
-                    advisor_policy = advice.policy_name
-                if advice.confidence is not None:
-                    advisor_metadata["advisor_confidence"] = advice.confidence
-                if advice.notes:
-                    advisor_metadata["advisor_notes"] = advice.notes
-                if advice.tags:
-                    advisor_metadata["advisor_tags"] = advice.tags
-                if advice.parser_hint:
-                    advisor_parser_hint = advice.parser_hint
-                if advice.chunk_overrides:
-                    advisor_overrides = advice.chunk_overrides
-            # Advisor-first policy selection, then explicit override, then default.
-            policy_hint = advisor_policy or submission.schema
-            policy = self._resolve_policy(policy_hint)
-            if advisor_overrides:
-                policy = _apply_policy_overrides(policy, advisor_overrides)
-                advisor_metadata.setdefault("advisor_policy_overrides", advisor_overrides)
 
-            synthesis_metadata: Dict[str, object] = {}
-            if (
-                self._policy_synthesizer
-                and not submission.schema
-                and policy.policy_name == "default"
-            ):
-                preview = self._preview_text(acquisition.content)
-                synthesis = self._policy_synthesizer.synthesize(
-                    title=submission.document_title,
-                    content=preview,
-                    existing_policy=policy.policy_name,
-                    advisor_tags=advisor_metadata.get("advisor_tags"),
-                )
-                if synthesis:
-                    overrides = synthesis.to_overrides()
-                    if overrides:
-                        policy = _apply_policy_overrides(policy, overrides)
-                    synthesis_metadata = {
-                        "synthesized_policy": {
-                            "chunk_modes": synthesis.chunk_modes,
-                            "window_size": synthesis.window_size,
-                            "window_overlap": synthesis.window_overlap,
-                            "max_chunk_tokens": synthesis.max_chunk_tokens,
-                            "highlight_phrases": synthesis.highlight_phrases,
-                            "notes": synthesis.notes,
-                            "confidence": synthesis.confidence,
-                        }
-                    }
+            # Step 1: Select parser (needed before policy decision for section-based sampling)
             parser_name, parser_source = self._select_parser(
                 submission,
-                advisor_parser_hint,
+                None,  # Parser hint comes from policy decision below
                 acquisition.parser_hint,
                 acquisition.content_type,
             )
+
+            # Step 2: Parse document FIRST to get structured sections
+            parser = self._parser_registry.resolve(parser_name)
+            content_type = acquisition.content_type
+            try:
+                sections_iter = parser.parse(
+                    acquisition.content,
+                    document_title=submission.document_title,
+                    content_type=content_type,
+                )
+                parsed_sections = list(sections_iter)
+            except Exception as exc:
+                self._logger.warning(
+                    "document.parse_failed_before_policy",
+                    extra={"document_id": submission.document_id, "parser": parser_name, "error": str(exc)},
+                    exc_info=True,
+                )
+                # Fall back to raw content preview on parse error
+                parsed_sections = None
+
+            # Step 3: Resolve policy (simplified - no LLM orchestration)
+            # Use schema hint from submission, or default policy
+            policy = self._resolve_policy(submission.schema)
             document_metadata = {
                 **acquisition.metadata,
                 **submission.metadata,
@@ -1106,7 +1094,8 @@ class IngestionCoordinator:
                     tenant=tenant,
                     document_id=submission.document_id,
                     document_title=submission.document_title,
-                    content=acquisition.content,
+                    content=acquisition.content if parsed_sections is None else None,
+                    sections=parsed_sections,
                     policy=policy,
                     parser_name=parser_name,
                     document_metadata=document_metadata,
@@ -1188,6 +1177,51 @@ class IngestionCoordinator:
         else:
             text = content
         return text[:limit]
+
+    def _build_section_preview(self, sections: List[SectionText], limit: int = 4000) -> str:
+        """
+        Build intelligent preview from parsed sections for policy decision.
+
+        Skips front matter (pages 1-3), samples representative sections
+        from beginning, middle, and end of document.
+        """
+        if not sections:
+            return ""
+
+        # Filter out front matter (typically pages 1-3: title, copyright, TOC)
+        content_sections = [s for s in sections if s.start_page > 3]
+        if not content_sections:
+            # If all sections are in first 3 pages, use them all
+            content_sections = sections
+
+        # Select representative sections
+        if len(content_sections) <= 3:
+            selected = content_sections
+        else:
+            # Sample: first 2 sections + middle + last
+            middle_idx = len(content_sections) // 2
+            selected = [
+                content_sections[0],      # First real section
+                content_sections[1],      # Second section
+                content_sections[middle_idx],  # Middle section
+                content_sections[-1],     # Last section
+            ]
+
+        # Build preview from selected sections
+        samples = []
+        chars_used = 0
+        chars_per_section = limit // len(selected)
+
+        for section in selected:
+            # Include section title and first N chars of text
+            section_sample = f"## {section.title}\n{section.text[:chars_per_section]}"
+            samples.append(section_sample)
+            chars_used += len(section_sample)
+            if chars_used >= limit:
+                break
+
+        preview = "\n\n---\n\n".join(samples)
+        return preview[:limit]
 
     def _record_stage(
         self,

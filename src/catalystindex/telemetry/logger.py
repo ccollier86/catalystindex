@@ -383,5 +383,45 @@ class AuditLogger:
             payload["metadata"] = metadata
         LOGGER.info("audit.feedback_recorded", extra=payload)
 
+    def knowledge_base_created(
+        self,
+        tenant: Tenant,
+        *,
+        knowledge_base_id: str,
+        description: str | None = None,
+        keywords: List[str] | None = None,
+    ) -> None:
+        """Log knowledge base creation event."""
+        LOGGER.info(
+            "audit.knowledge_base_created",
+            extra={
+                "tenant": asdict(tenant),
+                "knowledge_base_id": knowledge_base_id,
+                "description": description,
+                "keywords": keywords or [],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def knowledge_base_updated(
+        self,
+        tenant: Tenant,
+        *,
+        knowledge_base_id: str,
+        description: str | None = None,
+        keywords: List[str] | None = None,
+    ) -> None:
+        """Log knowledge base update event."""
+        LOGGER.info(
+            "audit.knowledge_base_updated",
+            extra={
+                "tenant": asdict(tenant),
+                "knowledge_base_id": knowledge_base_id,
+                "description": description,
+                "keywords": keywords or [],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
 
 __all__ = ["MetricsRecorder", "AuditLogger"]

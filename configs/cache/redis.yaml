@@ -1,0 +1,8 @@
+# @package _global_
+# Redis semantic cache configuration
+
+semantic_cache:
+  enabled: ${oc.env:CATALYST_SEMANTIC_CACHE__enabled,true}
+  redis_url: ${oc.env:CATALYST_SEMANTIC_CACHE__redis_url,redis://redis:6379/2}
+  distance_threshold: ${oc.env:CATALYST_SEMANTIC_CACHE__distance_threshold,0.15}
+  ttl_seconds: ${oc.env:CATALYST_SEMANTIC_CACHE__ttl_seconds,86400}  # 24 hours

@@ -1,24 +1,26 @@
 from __future__ import annotations
 
-import hashlib
-from collections import Counter
 from importlib import import_module
 from importlib.util import find_spec
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple, TYPE_CHECKING
 
 from ..embeddings.base import EmbeddingProvider
 from ..models.common import RetrievalResult, Tenant
 
 from ..storage.vector_store import VectorStoreClient
 from ..storage.term_index import TermIndex
+from ..storage.visual_store import VisualStore
 from ..telemetry.logger import AuditLogger, MetricsRecorder
+
+if TYPE_CHECKING:
+    from ..sparse.qodex_generator import QodexSparseGenerator
 
 
 @dataclass(slots=True)
 class SearchOptions:
-    mode: str = "economy"
+    mode: str = "premium"  # Premium (hybrid search + reranking) is default; economy is opt-in
     tracks: Tuple["TrackOptions", ...] | None = None
     filters: Dict[str, object] | None = None
     limit: int | None = None
@@ -61,6 +63,7 @@ class SearchExecution:
     results: List[RetrievalResult]
     debug: SearchDebugDetails | None = None
     explanations: Dict[str, str] = field(default_factory=dict)
+    reranked: bool = False  # Whether reranking was applied
 
 
 class SearchService:
@@ -74,18 +77,21 @@ class SearchService:
         term_index: TermIndex | None,
         audit_logger: AuditLogger,
         metrics: MetricsRecorder,
+        visual_store: VisualStore | None = None,
         reranker: "Reranker" | None = None,
         economy_k: int = 10,
         premium_k: int = 24,
         enable_sparse_queries: bool = False,
         premium_rerank_enabled: bool = True,
         feedback_weight: float = 0.15,
+        sparse_generator: "QodexSparseGenerator | None" = None,
     ) -> None:
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
         self._term_index = term_index
         self._audit_logger = audit_logger
         self._metrics = metrics
+        self._visual_store = visual_store  # Optional visual element storage
 
         self._reranker = reranker
         self._economy_k = max(1, economy_k)
@@ -93,6 +99,7 @@ class SearchService:
         self._sparse_queries_enabled = enable_sparse_queries
         self._premium_rerank_enabled = premium_rerank_enabled
         self._feedback_weight = max(0.0, feedback_weight)
+        self._sparse_generator = sparse_generator
 
     def retrieve(self, tenant: Tenant, *, query: str, options: SearchOptions | None = None) -> SearchExecution:
         options = options or SearchOptions()
@@ -107,8 +114,8 @@ class SearchService:
         track_options = self._resolve_tracks(options, analysis, default_limit=limit, mode=normalized_mode)
         results_by_track: Dict[str, List[RetrievalResult]] = {}
         sparse_query = None
-        if self._sparse_queries_enabled and normalized_mode == "premium":
-            sparse_query = self._build_sparse_query(expanded_query)
+        if self._sparse_queries_enabled and normalized_mode == "premium" and self._sparse_generator:
+            sparse_query = self._sparse_generator.generate_from_query(expanded_query)
         for track in track_options:
             track_limit = track.limit or limit
             filters = self._merge_filters(options.filters, track.filters, options.knowledge_base_ids)
@@ -130,14 +137,22 @@ class SearchService:
                     results_by_track[track.name] = filtered
 
         fused_results = self._fuse_results(results_by_track, limit)
+        # Reranking is ENABLED BY DEFAULT (must be explicitly disabled)
+        # Works in both economy and premium mode when premium_rerank_enabled=True
+        reranked = False
         if (
-            normalized_mode == "premium"
-            and self._reranker
+            self._reranker
             and self._premium_rerank_enabled
             and fused_results
         ):
             fused_results = list(self._reranker.rerank(expanded_query, fused_results, limit=limit))
+            reranked = True
         final_results = self._apply_feedback_boost(fused_results[:limit])
+
+        # Enrich results with visual elements if visual_store is available
+        if self._visual_store and options.knowledge_base_ids:
+            kb_id = options.knowledge_base_ids[0]  # Use first KB for now
+            final_results = self._enrich_with_visuals(tenant, final_results, kb_id)
 
         explanations = {
             result.chunk.chunk_id: self._build_explanation(result, index)
@@ -162,7 +177,7 @@ class SearchService:
             latency_ms=duration_ms,
         )
         self._audit_logger.search_executed(tenant, query=expanded_query, result_count=len(final_results))
-        return SearchExecution(results=final_results, debug=debug, explanations=explanations)
+        return SearchExecution(results=final_results, debug=debug, explanations=explanations, reranked=reranked)
 
     # Internal helpers -------------------------------------------------
     def _filter_noisy_chunks(self, results: Sequence[RetrievalResult]) -> List[RetrievalResult]:
@@ -280,24 +295,6 @@ class SearchService:
         sanitized = {key: value for key, value in merged.items() if value is not None}
         return sanitized or None
 
-    def _build_sparse_query(self, query: str) -> Dict[int, float] | None:
-        tokens = [token for token in query.lower().split() if token]
-        if not tokens:
-            return None
-        counts = Counter(tokens)
-        if not counts:
-            return None
-        max_count = max(counts.values())
-        if max_count <= 0:
-            return None
-        scale = 1.0 / float(max_count)
-        sparse_vector: Dict[int, float] = {}
-        for token, count in counts.items():
-            digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
-            index = int(digest[:8], 16) % 131071 or 1
-            sparse_vector[index] = float(count) * scale
-        return sparse_vector
-
     def _fuse_results(self, results: Mapping[str, Sequence[RetrievalResult]], limit: int) -> List[RetrievalResult]:
         if not results:
             return []
@@ -348,6 +345,77 @@ class SearchService:
         return (
             f"Rank {index} from {result.track} track, tier={chunk.chunk_tier}, score={result.score:.3f}."
         )
+
+    def _enrich_with_visuals(
+        self,
+        tenant: Tenant,
+        results: List[RetrievalResult],
+        knowledge_base_id: str,
+    ) -> List[RetrievalResult]:
+        """
+        Enrich search results with visual elements (images/tables).
+
+        Checks each chunk's metadata for visual_element_ids and fetches
+        the corresponding visual elements from the visual store.
+        """
+        if not results or not self._visual_store:
+            return results
+
+        # Collect all visual element IDs from all chunks
+        all_visual_ids: List[str] = []
+        for result in results:
+            visual_ids = result.chunk.metadata.get("visual_element_ids", [])
+            if isinstance(visual_ids, list):
+                all_visual_ids.extend(visual_ids)
+
+        if not all_visual_ids:
+            # No visual elements referenced
+            return results
+
+        # Fetch all visual elements in one batch
+        try:
+            visual_elements = self._visual_store.get_visuals(
+                tenant=tenant,
+                visual_element_ids=all_visual_ids,
+                knowledge_base_id=knowledge_base_id,
+            )
+
+            # Index visuals by element_id for fast lookup
+            visuals_by_id = {v.element_id: v for v in visual_elements}
+
+            # Enrich each result with its visual elements
+            enriched_results: List[RetrievalResult] = []
+            for result in results:
+                visual_ids = result.chunk.metadata.get("visual_element_ids", [])
+                if visual_ids and isinstance(visual_ids, list):
+                    # Fetch visuals for this chunk
+                    chunk_visuals = [
+                        visuals_by_id[vid]
+                        for vid in visual_ids
+                        if vid in visuals_by_id
+                    ]
+
+                    if chunk_visuals:
+                        # Create new result with visual elements attached
+                        enriched_result = replace(result, visual_elements=chunk_visuals)
+                        enriched_results.append(enriched_result)
+                    else:
+                        # No visuals found, keep original
+                        enriched_results.append(result)
+                else:
+                    # No visual IDs, keep original
+                    enriched_results.append(result)
+
+            return enriched_results
+
+        except Exception as exc:
+            # Don't fail search if visual enrichment fails - log and return original results
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Failed to enrich results with visual elements: {exc}",
+                exc_info=True,
+            )
+            return results
 
 
 class Reranker:

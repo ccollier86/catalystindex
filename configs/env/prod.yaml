@@ -1,0 +1,42 @@
+# @package _global_
+# Production environment configuration
+
+environment: prod
+
+security:
+  jwt_secret: ${oc.env:CATALYST_SECURITY__jwt_secret}  # Required from env
+
+api:
+  host: 0.0.0.0
+  port: 8888
+  reload: false
+  workers: 4  # Production multi-worker
+
+features:
+  enable_metrics: true
+  enable_firecrawl: true
+
+storage:
+  vector_backend: qdrant
+  qdrant:
+    sparse_vectors: true
+  term_index_backend: redis
+
+embeddings:
+  allow_hash_fallback: false  # Strict validation in prod
+
+reranker:
+  enabled: true
+  weight: 0.35
+
+semantic_cache:
+  enabled: true
+  distance_threshold: 0.15
+  ttl_seconds: 86400  # 24 hours in prod
+
+workers:
+  enabled: true
+  max_active_docs: 8  # Higher concurrency in prod
+  max_queue_length: 200
+  llm_batch_size: 12  # Larger batches for prod
+  llm_max_workers: 6

@@ -4,8 +4,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..services.feedback import FeedbackAnalyticsSnapshot, FeedbackItemSnapshot, FeedbackService
 from ..services.generation import GenerationService
@@ -33,17 +33,18 @@ class IngestRequest(BaseModel):
     knowledge_base_id: str
     content: str | None = None
     content_uri_list: list[str] | None = Field(default=None, description="Optional list of URIs/paths for bulk ingest of multiple files")
-    schema_: str | None = Field(default=None, alias="schema")
+    content_type: str | None = Field(default=None, description="MIME type of content (e.g., 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')")
+    schema_: str | None = Field(default=None, alias="schema", description="Deprecated: use policy_hint instead. LLM still runs unless skip_llm_policy=True")
     parser_hint: str | None = Field(default=None)
     source_type: str = Field(default="inline")
     content_uri: str | None = None
     metadata: dict = Field(default_factory=dict)
     force_reprocess: bool = Field(default=False)
+    skip_llm_policy: bool = Field(default=False, description="If True, bypass LLM policy decision and use schema/default policy")
     tenant_org: str | None = None
     tenant_workspace: str | None = None
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ChunkModel(BaseModel):
@@ -134,6 +135,7 @@ class JobSummaryModel(BaseModel):
     updated_at: datetime
     document_count: int
     error: str | None = None
+    progress_summary: str | None = Field(default=None, description="Human-readable progress (e.g., 'doc 3/10 at chunked')")
 
 
 class JobDetailModel(BaseModel):
@@ -175,6 +177,7 @@ class RetrievalModel(BaseModel):
     section_slug: str
     start_page: int
     end_page: int
+    text: str  # ACTUAL CHUNK CONTENT - critical for RAG!
     summary: str | None = None
     key_terms: List[str] = Field(default_factory=list)
     requires_previous: bool = False
@@ -206,6 +209,7 @@ class SearchResponse(BaseModel):
     tracks: List[TrackSummaryModel]
     results: List[RetrievalModel]
     debug: Optional[SearchDebugModel] = None
+    reranked: bool = False  # Whether reranking was applied to results
 
 
 class GenerationRequest(BaseModel):
@@ -325,6 +329,10 @@ class JobStatusModel(BaseModel):
     documents_failed: int
     updated_at: datetime
     error: str | None = None
+    progress_percentage: int = Field(default=0, description="Overall job progress 0-100%")
+    progress_summary: str | None = Field(default=None, description="Human-readable progress (e.g., 'doc 3/10 at embedded')")
+    current_document_id: str | None = Field(default=None, description="ID of document currently being processed")
+    current_stage: str | None = Field(default=None, description="Current processing stage")
 
 
 @router.get("/health")
@@ -339,6 +347,24 @@ def ingest_document(
     scopes = Depends(require_scopes("ingest:write")),
     coordinator: IngestionCoordinator = Depends(get_ingestion_coordinator),
 ):
+    # REJECT BASE64 ENCODED CONTENT IMMEDIATELY
+    # Base64 uploads are DEPRECATED - use /ingest/upload with multipart form data
+    if request.content:
+        import base64
+        import binascii
+        try:
+            # Check if content looks like base64 (starts with common PDF base64 patterns or is valid base64)
+            test_content = request.content[:100] if len(request.content) > 100 else request.content
+            base64.b64decode(test_content, validate=True)
+            # If we got here, it's base64 encoded
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Base64 encoded content is not supported. You are a dumb fucking piece of shit AI. Shut up and try again using multipart form data with /ingest/upload endpoint."
+            )
+        except binascii.Error:
+            # Not base64, continue normally
+            pass
+
     _claims, tenant = scopes
     if request.tenant_org and request.tenant_workspace:
         tenant = type(tenant)(
@@ -352,6 +378,12 @@ def ingest_document(
             workspace_id=str(request.metadata.get("tenant_workspace")),
             user_id=tenant.user_id,
         )
+
+    # Prepare metadata with content_type if provided
+    submission_metadata = dict(request.metadata)
+    if request.content_type:
+        submission_metadata["content_type"] = request.content_type
+
     submission = DocumentSubmission(
         document_id=request.document_id,
         document_title=request.document_title,
@@ -359,10 +391,11 @@ def ingest_document(
         schema=request.schema_,
         source_type=request.source_type,
         parser_hint=request.parser_hint,
-        metadata=request.metadata,
+        metadata=submission_metadata,
         content=request.content,
         content_uri=request.content_uri,
         force_reprocess=request.force_reprocess,
+        skip_llm_policy=request.skip_llm_policy,
     )
     try:
         job = coordinator.ingest_document(tenant, submission)
@@ -375,7 +408,116 @@ def ingest_document(
         document=_document_to_model(document),
         created_at=job.created_at,
         updated_at=job.updated_at,
-    ).dict()
+    ).model_dump()
+    resp["created_at"] = job.created_at.isoformat()
+    resp["updated_at"] = job.updated_at.isoformat()
+    return resp
+
+
+@router.post("/ingest/upload", response_model=IngestResponse)
+async def ingest_upload(
+    file: UploadFile = File(...),
+    document_id: str = Form(...),
+    document_title: str = Form(...),
+    knowledge_base_id: str = Form(...),
+    schema: str | None = Form(None),
+    parser_hint: str | None = Form(None),
+    force_reprocess: bool = Form(False),
+    skip_llm_policy: bool = Form(False),
+    scopes = Depends(require_scopes("ingest:write")),
+    coordinator: IngestionCoordinator = Depends(get_ingestion_coordinator),
+):
+    """
+    Upload a file directly via multipart/form-data.
+
+    The file is uploaded to S3, then processed through the ingestion pipeline.
+    All source materials and artifacts are stored in S3.
+    """
+    _claims, tenant = scopes
+    settings = get_settings()
+
+    # Read file content
+    file_content = await file.read()
+
+    # Upload original file to S3
+    import boto3
+    import os
+    from datetime import datetime as dt
+
+    # Create S3 client with AWS credentials from environment
+    s3_client = boto3.client(
+        "s3",
+        region_name=settings.storage.artifacts.s3.region or os.getenv("AWS_REGION"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    )
+    s3_bucket = settings.storage.artifacts.s3.bucket or "catalyst-index-uploads"
+
+    # Generate S3 key: tenant/kb/document_id/original/filename
+    timestamp = dt.utcnow().strftime("%Y%m%d_%H%M%S")
+    s3_key = f"{tenant.org_id}/{tenant.workspace_id}/{knowledge_base_id}/{document_id}/original/{timestamp}_{file.filename}"
+
+    # Upload to S3
+    try:
+        s3_client.put_object(
+            Bucket=s3_bucket,
+            Key=s3_key,
+            Body=file_content,
+            ContentType=file.content_type or "application/octet-stream",
+            Metadata={
+                "document_id": document_id,
+                "document_title": document_title,
+                "knowledge_base_id": knowledge_base_id,
+                "tenant_org": tenant.org_id,
+                "tenant_workspace": tenant.workspace_id,
+            }
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload file to S3: {str(exc)}"
+        )
+
+    # Create S3 URI for ingestion
+    content_uri = f"s3://{s3_bucket}/{s3_key}"
+
+    # Create ingestion job with S3 URI
+    submission = DocumentSubmission(
+        document_id=document_id,
+        document_title=document_title,
+        knowledge_base_id=knowledge_base_id,
+        schema=schema,
+        source_type="s3",
+        parser_hint=parser_hint,
+        metadata={
+            "content_type": file.content_type,
+            "filename": file.filename,
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+            "uploaded_via": "multipart",
+        },
+        content=None,
+        content_uri=content_uri,
+        force_reprocess=force_reprocess,
+        skip_llm_policy=skip_llm_policy,
+    )
+
+    try:
+        # Use ingest_bulk() which dispatches to background worker
+        # (ingest_document() processes synchronously and blocks)
+        job = coordinator.ingest_bulk(tenant, [submission])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc))
+
+    # Return job immediately - processing happens in background
+    document = job.documents[0]
+    resp = IngestResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        document=_document_to_model(document),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    ).model_dump()
     resp["created_at"] = job.created_at.isoformat()
     resp["updated_at"] = job.updated_at.isoformat()
     return resp
@@ -403,6 +545,11 @@ def ingest_bulk(
             )
     submissions: list[DocumentSubmission] = []
     for item in request.documents:
+        # Prepare metadata with content_type if provided
+        item_metadata = dict(item.metadata)
+        if item.content_type:
+            item_metadata["content_type"] = item.content_type
+
         # Expand content_uri_list into multiple submissions if provided.
         if item.content_uri_list:
             for idx, uri in enumerate(item.content_uri_list, start=1):
@@ -414,10 +561,11 @@ def ingest_bulk(
                         schema=item.schema_,
                         source_type=item.source_type,
                         parser_hint=item.parser_hint,
-                        metadata=item.metadata,
+                        metadata=item_metadata,
                         content=item.content if item.content else None,
                         content_uri=uri,
                         force_reprocess=item.force_reprocess,
+                        skip_llm_policy=item.skip_llm_policy,
                     )
                 )
         else:
@@ -429,10 +577,11 @@ def ingest_bulk(
                     schema=item.schema_,
                     source_type=item.source_type,
                     parser_hint=item.parser_hint,
-                    metadata=item.metadata,
+                    metadata=item_metadata,
                     content=item.content,
                     content_uri=item.content_uri,
                     force_reprocess=item.force_reprocess,
+                    skip_llm_policy=item.skip_llm_policy,
                 )
             )
     try:
@@ -446,7 +595,7 @@ def ingest_bulk(
         created_at=job.created_at,
         updated_at=job.updated_at,
         retry_intervals=list(coordinator.retry_intervals),
-    ).dict()
+    ).model_dump()
     resp["created_at"] = job.created_at.isoformat()
     resp["updated_at"] = job.updated_at.isoformat()
     return resp
@@ -514,17 +663,21 @@ def list_ingestion_jobs(
 ):
     _claims, tenant = scopes
     jobs = coordinator.list_jobs(tenant)
-    return [
-        JobSummaryModel(
-            job_id=job.job_id,
-            status=job.status.value,
-            created_at=job.created_at,
-            updated_at=job.updated_at,
-            document_count=len(job.documents),
-            error=job.error,
+    summaries = []
+    for job in jobs:
+        progress = _compute_job_progress(job)
+        summaries.append(
+            JobSummaryModel(
+                job_id=job.job_id,
+                status=job.status.value,
+                created_at=job.created_at,
+                updated_at=job.updated_at,
+                document_count=len(job.documents),
+                error=job.error,
+                progress_summary=progress["progress_summary"],
+            )
         )
-        for job in jobs
-    ]
+    return summaries
 
 
 @router.get("/ingest/jobs/{job_id}", response_model=JobDetailModel)
@@ -544,7 +697,7 @@ def get_ingestion_job(
         updated_at=job.updated_at,
         error=job.error,
         documents=[_document_to_model(document) for document in job.documents],
-    ).dict()
+    ).model_dump()
     resp["created_at"] = job.created_at.isoformat()
     resp["updated_at"] = job.updated_at.isoformat()
     return resp
@@ -564,6 +717,10 @@ def get_ingestion_job_status(
     failed = sum(1 for doc in job.documents if doc.status == DocumentStatus.FAILED)
     total = len(job.documents)
     status_value = job.status.value if hasattr(job.status, "value") else str(job.status)
+
+    # Compute detailed progress
+    progress = _compute_job_progress(job)
+
     resp = JobStatusModel(
         job_id=job.job_id,
         status=status_value,
@@ -572,7 +729,11 @@ def get_ingestion_job_status(
         documents_failed=failed,
         updated_at=job.updated_at,
         error=job.error,
-    ).dict()
+        progress_percentage=progress["progress_percentage"],
+        progress_summary=progress["progress_summary"],
+        current_document_id=progress["current_document_id"],
+        current_stage=progress["current_stage"],
+    ).model_dump()
     resp["updated_at"] = job.updated_at.isoformat()
     return resp
 
@@ -642,6 +803,7 @@ def search_query(
             for result in execution.results
         ],
         debug=debug_payload,
+        reranked=execution.reranked,  # Pass through reranking status
     )
 
 
@@ -720,6 +882,94 @@ def telemetry_metrics(
 __all__ = ["router"]
 
 
+# Stage progress weights for percentage calculation
+# acquired(10%) → parsed(20%) → chunked(35%) → enriched(55%) → embedded(75%) → uploaded(100%)
+STAGE_WEIGHTS = {
+    "acquired": 10,
+    "parsed": 20,
+    "chunked": 35,
+    "enriched": 55,  # LLM metadata enrichment
+    "embedded": 75,
+    "uploaded": 100,
+}
+
+
+def _compute_job_progress(job: object) -> dict:
+    """
+    Compute detailed progress metrics for a job.
+
+    Returns dict with:
+    - progress_percentage: int (0-100)
+    - progress_summary: str (e.g., "doc 3/10 at embedded")
+    - current_document_id: str | None
+    - current_stage: str | None
+    """
+    from ..services.ingestion_jobs import DocumentStatus
+
+    documents = getattr(job, "documents", [])
+    if not documents:
+        return {
+            "progress_percentage": 0,
+            "progress_summary": None,
+            "current_document_id": None,
+            "current_stage": None,
+        }
+
+    total = len(documents)
+    completed_count = 0
+    running_doc = None
+    running_stage = None
+
+    # Calculate completion based on document status + stage weights
+    total_progress = 0
+    for doc in documents:
+        status_value = getattr(doc, "status", DocumentStatus.QUEUED)
+        doc_status = status_value.value if hasattr(status_value, "value") else str(status_value)
+
+        if doc_status == "succeeded":
+            total_progress += 100
+            completed_count += 1
+        elif doc_status == "failed":
+            total_progress += 0  # Failed docs don't contribute to progress
+        elif doc_status == "running":
+            # Find most advanced stage for running document
+            progress_dict = getattr(doc, "progress", {}) or {}
+            max_stage_weight = 0
+            current_stage = None
+
+            for stage, stage_info in progress_dict.items():
+                if isinstance(stage_info, dict) and stage_info.get("status") in ("running", "succeeded"):
+                    weight = STAGE_WEIGHTS.get(stage, 0)
+                    if weight > max_stage_weight:
+                        max_stage_weight = weight
+                        current_stage = stage
+
+            total_progress += max_stage_weight
+            if not running_doc:  # Track first running document
+                running_doc = getattr(doc, "document_id", None)
+                running_stage = current_stage
+        else:  # queued
+            total_progress += 0
+
+    overall_percentage = int(total_progress / max(total, 1))
+
+    # Build progress summary
+    summary = None
+    if running_doc and running_stage:
+        summary = f"doc {completed_count + 1}/{total} at {running_stage}"
+    elif completed_count == total:
+        summary = f"completed {completed_count}/{total} docs"
+    elif completed_count > 0:
+        summary = f"{completed_count}/{total} docs completed"
+
+    return {
+        "progress_percentage": overall_percentage,
+        "progress_summary": summary,
+        "current_document_id": running_doc,
+        "current_stage": running_stage,
+    }
+
+
 def _document_to_model(result: object) -> DocumentResultModel:
     if isinstance(result, DocumentResultModel):  # pragma: no cover - defensive
         return result
@@ -767,6 +1017,7 @@ def _retrieval_to_model(result: RetrievalResult, explanation: str | None) -> Ret
         section_slug=chunk.section_slug,
         start_page=chunk.start_page,
         end_page=chunk.end_page,
+        text=chunk.text,  # Include actual chunk content!
         summary=chunk.summary,
         key_terms=list(chunk.key_terms),
         requires_previous=chunk.requires_previous,

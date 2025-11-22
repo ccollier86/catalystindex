@@ -1,0 +1,63 @@
+# Catalyst Index - Hydra Base Configuration
+# This file defines the default configuration composition using Hydra's defaults list
+# Override via CLI: python hydra_main.py env=prod storage=qdrant embeddings=openai
+
+defaults:
+  - env: dev
+  - storage: qdrant
+  - embeddings: openai
+  - reranker: openai
+  - cache: redis
+  - db: postgres
+  - artifacts: local
+  - workers: default
+  - _self_
+
+# Environment name (overridden by env config group)
+environment: dev
+
+# Security settings (sensitive values use environment variable interpolation)
+security:
+  jwt_secret: ${oc.env:CATALYST_SECURITY__jwt_secret,dev-secret}
+
+# API server settings
+api:
+  host: ${oc.env:CATALYST_API__host,0.0.0.0}
+  port: ${oc.env:CATALYST_API__port,8888}
+  reload: ${oc.env:CATALYST_API__reload,false}
+  workers: ${oc.env:CATALYST_API__workers,1}
+
+# Feature flags
+features:
+  enable_metrics: ${oc.env:CATALYST_FEATURES__enable_metrics,true}
+  enable_firecrawl: ${oc.env:CATALYST_ACQUISITION__firecrawl__enabled,false}
+
+# Metrics exporter (Prometheus)
+metrics:
+  exporter_port: ${oc.env:CATALYST_METRICS_EXPORTER_PORT,9464}
+  exporter_address: ${oc.env:CATALYST_METRICS_EXPORTER_ADDRESS,0.0.0.0}
+
+# Firecrawl web scraping integration
+acquisition:
+  firecrawl:
+    enabled: ${features.enable_firecrawl}
+    api_key: ${oc.env:CATALYST_ACQUISITION__firecrawl__api_key,}
+
+# Policy advisor (LLM-powered policy synthesis)
+policy_advisor:
+  enabled: ${oc.env:CATALYST_POLICY_ADVISOR__enabled,true}
+  model: ${oc.env:CATALYST_POLICY_ADVISOR__model,gpt-4o-mini}
+  api_key: ${oc.env:CATALYST_POLICY_ADVISOR__api_key,${oc.env:OPENAI_API_KEY}}
+
+# Policy synthesis (policy document generation)
+policy_synthesis:
+  enabled: ${oc.env:CATALYST_POLICY_SYNTHESIS__enabled,true}
+  model: ${oc.env:CATALYST_POLICY_SYNTHESIS__model,gpt-4o-mini}
+  api_key: ${oc.env:CATALYST_POLICY_SYNTHESIS__api_key,${oc.env:OPENAI_API_KEY}}
+
+# Hydra runtime settings
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ./multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}

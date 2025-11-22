@@ -1,0 +1,23 @@
+# @package _global_
+# Qdrant vector storage configuration
+
+storage:
+  vector_backend: qdrant
+  vector_dimension: 3072  # text-embedding-3-large
+
+  qdrant:
+    host: ${oc.env:CATALYST_STORAGE__qdrant__host,qdrant}
+    port: ${oc.env:CATALYST_STORAGE__qdrant__port,6333}
+    api_key: ${oc.env:CATALYST_STORAGE__qdrant__api_key,}  # Optional for Qdrant Cloud
+    sparse_vectors: ${oc.env:CATALYST_STORAGE__qdrant__sparse_vectors,true}  # Hybrid search (dense + sparse)
+    batch_size: ${oc.env:CATALYST_STORAGE__qdrant__batch_size,100}
+    timeout: ${oc.env:CATALYST_STORAGE__qdrant__timeout,30}
+
+  term_index_backend: redis
+  redis:
+    url: ${oc.env:CATALYST_STORAGE__redis__url,redis://redis:6379/0}
+    max_connections: ${oc.env:CATALYST_STORAGE__redis__max_connections,50}
+
+  artifacts:
+    backend: local
+    base_path: ${oc.env:CATALYST_STORAGE__artifacts__base_path,/data/artifacts}
